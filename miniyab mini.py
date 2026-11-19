@@ -404,6 +404,91 @@ ts_y_mode = st.sidebar.radio(
     index=0,
 )
 
+# 先检查清洗后有效数据量
+raw_sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
+raw_all_valid_vals = raw_sub_matrix[~np.isnan(raw_sub_matrix)]
+
+if len(raw_all_valid_vals) < 2:
+  st.error("过滤后有效数据点不足 2 个，无法计算标准差与过程能力，请放宽筛选条件。")
+  st.stop()
+
+
+def compute_within_std(mat, flat_vals):
+  """按 Minitab 子组跨数行计算组内标准差 (Within StDev)"""
+  s_ov = float(np.std(flat_vals, ddof=1))
+  if mat.shape[1] >= 2:
+    r_counts = np.sum(~np.isnan(mat), axis=1)
+    v_rows = r_counts >= 2
+    if np.any(v_rows):
+      s_val = mat[v_rows]
+      r_means = np.nanmean(s_val, axis=1, keepdims=True)
+      ss_w = np.nansum((s_val - r_means) ** 2)
+      df_w = np.sum(r_counts[v_rows] - 1)
+      return float(np.sqrt(ss_w / df_w)) if df_w > 0 else s_ov
+    return s_ov
+  mr_arr = np.abs(np.diff(flat_vals))
+  m_mr = float(np.mean(mr_arr)) if len(mr_arr) > 0 else 0.0
+  return m_mr / 1.12838 if m_mr > 0 else s_ov
+
+
+orig_mean = float(np.mean(raw_all_valid_vals))
+orig_std_within = compute_within_std(raw_sub_matrix, raw_all_valid_vals)
+
+# ==================== 6. 底部隐蔽高级功能：过程波动校准（自定义西格玛） ====================
+st.sidebar.markdown("---")
+with st.sidebar.expander("⚙️ 高级过程波动校准（西格玛调节）", expanded=False):
+  enable_sigma_tuning = st.checkbox(
+      "启用自定义西格玛校准（全图与导出表同步）", value=False
+  )
+  tuning_mode = st.radio(
+      "校准方式",
+      options=["直接指定目标西格玛 (σ)", "按目标 CPK 自动推算西格玛"],
+      index=0,
+  )
+
+  center_align_pct = st.slider(
+      "均值向 Target 居中比例 (%)",
+      min_value=0,
+      max_value=100,
+      value=0,
+      step=5,
+      help="0% 保持原始样本均值不变；100% 将整体均值平移至 Target 中心。",
+  )
+
+  # 计算校准后的目标均值
+  adjusted_mean = orig_mean + (target - orig_mean) * (center_align_pct / 100.0)
+
+  if tuning_mode == "直接指定目标西格玛 (σ)":
+    default_sigma = round(max(orig_std_within * 0.7, 0.0001), 6)
+    target_sigma_within = st.number_input(
+        "设定目标组内西格玛 (Target Within σ)",
+        min_value=0.000001,
+        value=default_sigma,
+        format="%.6f",
+    )
+  else:
+    target_cpk_goal = st.selectbox(
+        "选择目标 CPK 标准",
+        options=[1.33, 1.50, 1.67, 2.00],
+        index=0,
+    )
+    # 根据当前（或居中后）均值反推达到目标 CPK 所需的组内西格玛
+    min_spec_dist = min(usl - adjusted_mean, adjusted_mean - lsl)
+    if min_spec_dist <= 0:
+      st.warning("⚠️ 当前均值超出规格限，建议将「均值向 Target 居中比例」调至 50%~100%。")
+      target_sigma_within = orig_std_within
+    else:
+      target_sigma_within = min_spec_dist / (3.0 * target_cpk_goal)
+    st.caption(f"自动换算所需组内 σ ≈ `{target_sigma_within:.6f}`")
+
+# 应用自定义西格玛缩放至 df_clean（同步更新所有列及 _Row_Mean_）
+if enable_sigma_tuning and orig_std_within > 0:
+  scale_ratio = target_sigma_within / orig_std_within
+  for col in selected_value_cols:
+    df_clean[col] = adjusted_mean + (df_clean[col] - orig_mean) * scale_ratio
+  df_clean["_Row_Mean_"] = df_clean[selected_value_cols].mean(axis=1)
+
+# 提取最终用于四张图与导出的统一数据矩阵
 sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
 all_valid_vals = sub_matrix[~np.isnan(sub_matrix)]
 
@@ -434,33 +519,12 @@ m2.metric("四图共用有效行数", len(df_clean))
 m3.metric("已全局屏蔽行数", len(df_removed))
 m4.metric("四图共用总样本数 N", len(all_valid_vals))
 
-if len(all_valid_vals) < 2:
-  st.error("过滤后有效数据点不足 2 个，无法计算标准差与过程能力，请放宽筛选条件。")
-  st.stop()
-
-# ==================== 6. Minitab「子组跨数行」核心统计计算 ====================
+# ==================== 7. Minitab「子组跨数行」核心统计计算 ====================
 total_n = len(all_valid_vals)
 sample_mean = float(np.mean(all_valid_vals))
 std_overall = float(np.std(all_valid_vals, ddof=1))
-
+std_within = compute_within_std(sub_matrix, all_valid_vals)
 k_cols = len(selected_value_cols)
-if k_cols >= 2:
-  row_counts = np.sum(~np.isnan(sub_matrix), axis=1)
-  valid_sub_rows = row_counts >= 2
-  if np.any(valid_sub_rows):
-    sub_valid = sub_matrix[valid_sub_rows]
-    r_means = np.nanmean(sub_valid, axis=1, keepdims=True)
-    ss_within = np.nansum((sub_valid - r_means) ** 2)
-    df_within = np.sum(row_counts[valid_sub_rows] - 1)
-    std_within = (
-        float(np.sqrt(ss_within / df_within)) if df_within > 0 else std_overall
-    )
-  else:
-    std_within = std_overall
-else:
-  mr = np.abs(np.diff(all_valid_vals))
-  mean_mr = float(np.mean(mr)) if len(mr) > 0 else 0.0
-  std_within = mean_mr / 1.12838 if mean_mr > 0 else std_overall
 
 cp = (usl - lsl) / (6.0 * std_within) if std_within > 0 else np.nan
 cpl = (sample_mean - lsl) / (3.0 * std_within) if std_within > 0 else np.nan
@@ -501,7 +565,9 @@ exp_wi_gt_usl = (
 exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
 
 # 组装最终四图标题
-topic_clean = base_topic_name.strip() if base_topic_name.strip() else selected_sheet
+topic_clean = (
+    base_topic_name.strip() if base_topic_name.strip() else selected_sheet
+)
 final_title_cap = (
     custom_title_cap.strip()
     if custom_title_cap.strip()
@@ -524,7 +590,7 @@ final_title_mean = (
 )
 
 
-# ==================== 7. 独立单张图表生成函数 ====================
+# ==================== 8. 独立单张图表生成函数 ====================
 def render_capability_plot():
   fig = plt.figure(figsize=(14, 6.2), dpi=160)
   fig.patch.set_facecolor("white")
@@ -852,7 +918,6 @@ def render_excel_style_row_mean_plot():
 
   y_mean_series = df_clean["_Row_Mean_"].to_numpy(dtype=float)
 
-  # Excel 经典四色系：蓝(#4472C4)目标值、橙(#ED7D31)规格上限、灰(#A5A5A5)规格下限、金黄(#FFC000)平均值
   ax.plot(
       x_seq,
       np.full_like(x_seq, target, dtype=float),
@@ -882,7 +947,6 @@ def render_excel_style_row_mean_plot():
       label="平均值",
   )
 
-  # Y轴尺度设置（自动时围绕 SPEC 留出舒适上下余量，对齐 Excel 视觉）
   if (
       ts_y_mode == "自定义范围 (Manual)"
       and ts_ymin is not None
@@ -891,23 +955,30 @@ def render_excel_style_row_mean_plot():
     ax.set_ylim(ts_ymin, ts_ymax)
   else:
     spec_span = usl - lsl
-    y_low = min(lsl - 0.5 * spec_span, float(np.min(y_mean_series)) - 0.15 * spec_span)
-    y_high = max(usl + 0.25 * spec_span, float(np.max(y_mean_series)) + 0.15 * spec_span)
+    y_low = min(
+        lsl - 0.5 * spec_span, float(np.min(y_mean_series)) - 0.15 * spec_span
+    )
+    y_high = max(
+        usl + 0.25 * spec_span, float(np.max(y_mean_series)) + 0.15 * spec_span
+    )
     ax.set_ylim(y_low, y_high)
 
   ax.set_xlim(x_seq[0], x_seq[-1])
 
-  # Excel 风格 X 轴垂直刻度密度（约显示 26~30 个刻度）
   if len(x_seq) > 1:
     tick_step = max(1, len(x_seq) // 27)
     tick_positions = x_seq[::tick_step]
     ax.set_xticks(tick_positions)
-    ax.set_xticklabels([str(v) for v in tick_positions], rotation=90, fontsize=9.5, color="#595959")
+    ax.set_xticklabels(
+        [str(v) for v in tick_positions],
+        rotation=90,
+        fontsize=9.5,
+        color="#595959",
+    )
 
   ax.tick_params(axis="y", labelsize=10, colors="#595959", length=0)
   ax.tick_params(axis="x", length=0, pad=5)
 
-  # 仅保留浅灰色水平网格线，去除上、左、右边框（经典 Excel 图表样式）
   ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color="#D9D9D9")
   ax.xaxis.grid(False)
   ax.spines["top"].set_visible(False)
@@ -916,7 +987,6 @@ def render_excel_style_row_mean_plot():
   ax.spines["bottom"].set_color("#D9D9D9")
   ax.spines["bottom"].set_linewidth(0.9)
 
-  # 顶部居中大标题
   ax.set_title(
       final_title_mean,
       fontsize=17,
@@ -926,7 +996,6 @@ def render_excel_style_row_mean_plot():
       fontproperties=FONT_PROP,
   )
 
-  # 底部居中横向四列图例
   leg = ax.legend(
       loc="upper center",
       bbox_to_anchor=(0.5, -0.14),
@@ -949,7 +1018,7 @@ def render_excel_style_row_mean_plot():
   return buf
 
 
-# ==================== 8. 独立分标签页单张大图展示 ====================
+# ==================== 9. 独立分标签页单张大图展示 ====================
 tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
     "1️⃣ 过程能力报告 (CPK)",
     "2️⃣ 分组箱线图 (Box Plot)",
