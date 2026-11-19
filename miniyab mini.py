@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import re
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="在线检测 SPC 与过程能力分析系统",
@@ -21,6 +23,100 @@ st.set_page_config(
 def render_app_header():
   st.title("在线检测 SPC 与过程能力分析系统")
   st.caption("Created by xu")
+
+
+COPY_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"'
+    ' viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+    ' stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>'
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2'
+    ' 2v1"></path></svg>'
+)
+
+CHECK_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"'
+    ' viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+    ' stroke-linecap="round" stroke-linejoin="round">'
+    '<polyline points="20 6 9 17 4 12"></polyline></svg>'
+)
+
+
+def render_copy_image_button(png_bytes, btn_key):
+  """渲染与参考图标一致的复制按钮，点击将 PNG 图片写入系统剪贴板"""
+  b64_png = base64.b64encode(png_bytes).decode("ascii")
+  safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", btn_key)
+  html_code = f"""
+    <div style="display:flex;align-items:center;gap:6px;height:38px;">
+      <button id="btn_{safe_id}" type="button" title="复制图片"
+        style="display:inline-flex;align-items:center;justify-content:center;
+               width:36px;height:36px;border-radius:8px;
+               border:1px solid rgba(128,128,128,0.35);
+               background:transparent;color:inherit;cursor:pointer;
+               transition:background 0.15s ease;">
+        {COPY_ICON_SVG}
+      </button>
+      <span id="msg_{safe_id}" style="font-size:12px;opacity:0.85;"></span>
+    </div>
+    <script>
+      (function() {{
+        const btn = document.getElementById("btn_{safe_id}");
+        const msg = document.getElementById("msg_{safe_id}");
+        const copySvg = `{COPY_ICON_SVG}`;
+        const checkSvg = `{CHECK_ICON_SVG}`;
+        const b64Data = "{b64_png}";
+        if (!btn) return;
+        btn.addEventListener("mouseenter", () => {{
+          btn.style.background = "rgba(128,128,128,0.14)";
+        }});
+        btn.addEventListener("mouseleave", () => {{
+          btn.style.background = "transparent";
+        }});
+        btn.addEventListener("click", async () => {{
+          try {{
+            const binStr = atob(b64Data);
+            const len = binStr.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {{
+              bytes[i] = binStr.charCodeAt(i);
+            }}
+            const blob = new Blob([bytes], {{ type: "image/png" }});
+            if (navigator.clipboard && window.ClipboardItem) {{
+              await navigator.clipboard.write([new ClipboardItem({{ "image/png": blob }})]);
+              btn.innerHTML = checkSvg;
+              msg.textContent = "已复制";
+              setTimeout(() => {{
+                btn.innerHTML = copySvg;
+                msg.textContent = "";
+              }}, 1800);
+            }} else {{
+              msg.textContent = "当前环境不支持复制，请点下载";
+            }}
+          }} catch (err) {{
+            msg.textContent = "复制受限，请点下载";
+          }}
+        }});
+      }})();
+    </script>
+    """
+  components.html(html_code, height=42)
+
+
+def render_chart_action_bar(png_buf, file_name, key_prefix):
+  """在图表下方同一行展示精简的「下载」按钮与「复制」图标按钮"""
+  png_bytes = png_buf.getvalue()
+  a1, a2, _ = st.columns([0.95, 2.2, 6.85])
+  with a1:
+    st.download_button(
+        "下载",
+        data=png_bytes,
+        file_name=file_name,
+        mime="image/png",
+        key=f"dl_{key_prefix}",
+        use_container_width=True,
+    )
+  with a2:
+    render_copy_image_button(png_bytes, f"cp_{key_prefix}")
 
 
 @st.cache_resource
@@ -1743,7 +1839,7 @@ if len(ready_projects) > 1:
   zip_buf.seek(0)
   safe_sheet = re.sub(r'[\\/*?:"<>|]', "_", selected_sheet)
   st.download_button(
-      f"📦 一键打包下载全部 {len(ready_projects)} 个项目图表 (.zip)",
+      "下载",
       data=zip_buf,
       file_name=f"{safe_sheet}_多项目SPC图表包.zip",
       mime="application/zip",
@@ -1776,13 +1872,8 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
       )
       buf_cap = render_capability_plot(b, t_cap, cap_w, cap_h)
       st.image(buf_cap, width=cap_px)
-      buf_cap.seek(0)
-      st.download_button(
-          f"🖼️ 下载 [{p_name}] 过程能力报告图 (.png)",
-          data=buf_cap,
-          file_name=f"{safe_prefix}_CPK.png",
-          mime="image/png",
-          key=f"dl_cap_{dataset_key}_{p_name}",
+      render_chart_action_bar(
+          buf_cap, f"{safe_prefix}_CPK.png", f"cap_{dataset_key}_{p_name}"
       )
 
     with tab_box:
@@ -1821,13 +1912,8 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           decimals=box_decimals,
       )
       st.image(buf_box, width=box_px)
-      buf_box.seek(0)
-      st.download_button(
-          f"🖼️ 下载 [{p_name}] 箱线图 (.png)",
-          data=buf_box,
-          file_name=f"{safe_prefix}_BoxPlot.png",
-          mime="image/png",
-          key=f"dl_box_{dataset_key}_{p_name}",
+      render_chart_action_bar(
+          buf_box, f"{safe_prefix}_BoxPlot.png", f"box_{dataset_key}_{p_name}"
       )
 
     with tab_ts:
@@ -1868,13 +1954,10 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           b, t_ts, ts_w, ts_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
       )
       st.image(buf_ts, width=ts_px)
-      buf_ts.seek(0)
-      st.download_button(
-          f"🖼️ 下载 [{p_name}] 多通道时间序列图 (.png)",
-          data=buf_ts,
-          file_name=f"{safe_prefix}_TimeSeries.png",
-          mime="image/png",
-          key=f"dl_ts_{dataset_key}_{p_name}",
+      render_chart_action_bar(
+          buf_ts,
+          f"{safe_prefix}_TimeSeries.png",
+          f"ts_{dataset_key}_{p_name}",
       )
 
     with tab_mean:
@@ -1914,13 +1997,10 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           b, t_mean, mean_w, mean_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
       )
       st.image(buf_mean, width=mean_px)
-      buf_mean.seek(0)
-      st.download_button(
-          f"🖼️ 下载 [{p_name}] 单行均值趋势图 (.png)",
-          data=buf_mean,
-          file_name=f"{safe_prefix}_RowMean_Trend.png",
-          mime="image/png",
-          key=f"dl_mean_{dataset_key}_{p_name}",
+      render_chart_action_bar(
+          buf_mean,
+          f"{safe_prefix}_RowMean_Trend.png",
+          f"mean_{dataset_key}_{p_name}",
       )
 
     with tab_data:
@@ -1932,7 +2012,7 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
         )
       excel_buf.seek(0)
       st.download_button(
-          f"📥 导出 [{p_name}] 有效数据与被屏蔽异常行 (.xlsx)",
+          "下载",
           data=excel_buf,
           file_name=f"{safe_prefix}_Filtered.xlsx",
           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
