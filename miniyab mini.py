@@ -128,7 +128,7 @@ if not numeric_cols_all:
   st.stop()
 
 
-def detect_spec_from_columns(df, num_cols):
+def detect_spec_from_columns(df, all_cols):
   """根据表头关键字自动匹配 规格下限(LSL)、目标值(Target)、规格上限(USL)"""
   lsl_col, target_col, usl_col = None, None, None
   lsl_keywords = ["规格下限", "下限", "下公差", "lsl", "lower"]
@@ -143,7 +143,9 @@ def detect_spec_from_columns(df, num_cols):
   ]
   usl_keywords = ["规格上限", "上限", "上公差", "usl", "upper"]
 
-  for col in num_cols:
+  for col in all_cols:
+    if col == "Row_Index":
+      continue
     col_clean = str(col).strip().lower()
     if lsl_col is None and any(k in col_clean for k in lsl_keywords):
       lsl_col = col
@@ -155,7 +157,7 @@ def detect_spec_from_columns(df, num_cols):
   def extract_representative_val(col_name):
     if col_name is None:
       return None
-    s = df[col_name].dropna()
+    s = pd.to_numeric(df[col_name], errors="coerce").dropna()
     if s.empty:
       return None
     modes = s.mode()
@@ -176,7 +178,7 @@ def detect_spec_from_columns(df, num_cols):
   }
 
 
-spec_info = detect_spec_from_columns(df_raw, numeric_cols_all)
+spec_info = detect_spec_from_columns(df_raw, df_raw.columns)
 measurement_candidates = [
     c for c in numeric_cols_all if c not in spec_info["spec_cols"]
 ]
@@ -196,55 +198,113 @@ selected_value_cols = st.sidebar.multiselect(
 )
 
 if not selected_value_cols:
-  st.warning("请在左侧至少选择一列检测数值列。")
+  st.warning("👈 请在左侧至少选择一列检测数值列。")
   st.stop()
 
-# ==================== 2. SPEC 规格设定 ====================
+# ==================== 2. SPEC 规格设定（自动匹配 + 换列重算 + 一键重置） ====================
 st.sidebar.header("2️⃣ SPEC 规格设定")
 dataset_key = f"{uploaded_file.name}::{selected_sheet}"
+cols_signature = tuple(selected_value_cols)
 
-fallback_mid = float(
-    np.nanmean(df_raw[selected_value_cols].to_numpy(dtype=float))
-)
-init_lsl = (
-    spec_info["lsl"]
-    if spec_info["lsl"] is not None
-    else round(fallback_mid - 1.0, 4)
-)
-init_target = (
-    spec_info["target"]
-    if spec_info["target"] is not None
-    else round(fallback_mid, 4)
-)
-init_usl = (
-    spec_info["usl"]
-    if spec_info["usl"] is not None
-    else round(fallback_mid + 1.0, 4)
+
+def compute_recommended_spec(df_src, cols_sel, s_info):
+  """优先返回表格识别到的 SPEC；若无则基于当前选定列的数据均值与标准差自动估算"""
+  vals = df_src[list(cols_sel)].to_numpy(dtype=float)
+  valid_v = vals[~np.isnan(vals)]
+  if len(valid_v) > 0:
+    mid = float(np.median(valid_v))
+    spread = float(np.std(valid_v, ddof=1)) if len(valid_v) > 1 else 0.0
+    half_tol = max(round(spread * 4.0, 4), 0.3) if spread > 0 else 1.0
+  else:
+    mid, half_tol = 0.0, 1.0
+
+  rec_lsl = s_info["lsl"] if s_info["lsl"] is not None else round(mid - half_tol, 4)
+  rec_usl = s_info["usl"] if s_info["usl"] is not None else round(mid + half_tol, 4)
+  if s_info["target"] is not None:
+    rec_target = s_info["target"]
+  elif s_info["lsl"] is not None and s_info["usl"] is not None:
+    rec_target = round((s_info["lsl"] + s_info["usl"]) / 2.0, 4)
+  else:
+    rec_target = round(mid, 4)
+  return float(rec_lsl), float(rec_target), float(rec_usl)
+
+
+rec_lsl, rec_target, rec_usl = compute_recommended_spec(
+    df_raw, selected_value_cols, spec_info
 )
 
-if (
-    spec_info["target"] is None
-    and spec_info["lsl"] is not None
-    and spec_info["usl"] is not None
-):
-  init_target = round((spec_info["lsl"] + spec_info["usl"]) / 2.0, 4)
+has_table_spec = any(
+    spec_info[k] is not None for k in ("lsl", "target", "usl")
+)
 
+# 判断是否需要初始化或自动重新获取上下限：
+# 1) 切换了文件/Sheet
+# 2) 因为清空 multiselect 导致 Streamlit 清理了输入框状态（或归零成 0==0）
+# 3) 表格无自带 SPEC 且用户重新选择了分析列（未手动锁定）
+need_auto_fill = False
 if st.session_state.get("active_dataset_key") != dataset_key:
   st.session_state["active_dataset_key"] = dataset_key
-  st.session_state["spec_lsl_input"] = float(init_lsl)
-  st.session_state["spec_target_input"] = float(init_target)
-  st.session_state["spec_usl_input"] = float(init_usl)
+  st.session_state["spec_manually_edited"] = False
+  need_auto_fill = True
+elif (
+    "spec_lsl_input" not in st.session_state
+    or "spec_usl_input" not in st.session_state
+    or st.session_state["spec_lsl_input"] >= st.session_state["spec_usl_input"]
+):
+  need_auto_fill = True
+elif (
+    not has_table_spec
+    and not st.session_state.get("spec_manually_edited", False)
+    and st.session_state.get("last_cols_signature") != cols_signature
+):
+  need_auto_fill = True
 
-if spec_info["spec_cols"]:
-  st.sidebar.caption("✅ 已自动匹配表格 SPEC 列（可随时手动改写）")
+st.session_state["last_cols_signature"] = cols_signature
+
+if need_auto_fill:
+  st.session_state["spec_lsl_input"] = rec_lsl
+  st.session_state["spec_target_input"] = rec_target
+  st.session_state["spec_usl_input"] = rec_usl
+
+
+def on_spec_manual_change():
+  st.session_state["spec_manually_edited"] = True
+
+
+if has_table_spec:
+  st.sidebar.caption("✅ 已从表格 SPEC 列自动获取上下限")
+else:
+  st.sidebar.caption("ℹ️ 表格无 SPEC 列，已按所选数据自动估算上下限")
 
 col_spec1, col_spec2, col_spec3 = st.sidebar.columns(3)
-lsl = col_spec1.number_input("LSL", key="spec_lsl_input", format="%.4f")
-target = col_spec2.number_input("Target", key="spec_target_input", format="%.4f")
-usl = col_spec3.number_input("USL", key="spec_usl_input", format="%.4f")
+lsl = col_spec1.number_input(
+    "LSL", key="spec_lsl_input", format="%.4f", on_change=on_spec_manual_change
+)
+target = col_spec2.number_input(
+    "Target",
+    key="spec_target_input",
+    format="%.4f",
+    on_change=on_spec_manual_change,
+)
+usl = col_spec3.number_input(
+    "USL", key="spec_usl_input", format="%.4f", on_change=on_spec_manual_change
+)
+
+# 始终保留一键重新获取/重置上下限按钮
+btn_label = (
+    "🔄 重新获取表格 SPEC 上下限"
+    if has_table_spec
+    else "🔄 按当前所选列重新估算上下限"
+)
+if st.sidebar.button(btn_label, use_container_width=True):
+  st.session_state["spec_manually_edited"] = False
+  st.session_state["spec_lsl_input"] = rec_lsl
+  st.session_state["spec_target_input"] = rec_target
+  st.session_state["spec_usl_input"] = rec_usl
+  st.rerun()
 
 if lsl >= usl:
-  st.sidebar.error("⚠️ LSL 必须小于 USL！")
+  st.sidebar.error("⚠️ LSL 必须小于 USL！请修改或点击上方按钮重置。")
   st.stop()
 
 # ==================== 3. 全局统一数据屏蔽引擎 ====================
@@ -402,7 +462,6 @@ if enable_sigma_tuning and orig_std_within > 0:
     df_clean[col] = adjusted_mean + (df_clean[col] - orig_mean) * scale_ratio
   df_clean["_Row_Mean_"] = df_clean[selected_value_cols].mean(axis=1)
 
-# 统一数据矩阵
 sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
 all_valid_vals = sub_matrix[~np.isnan(sub_matrix)]
 
@@ -720,12 +779,10 @@ def render_box_plot(
   ax.axhline(target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
   ax.axhline(lsl, color="#DC2626", ls="--", lw=1.2)
 
-  # 计算合适的字体大小，防止多箱体时文字重叠
   label_font_size = 8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0)
   x_offset = box_width * 0.54
   fmt_str = f"{{:.{decimals}f}}"
 
-  # 若开启均值显示，绘制均值标记点
   if show_mean_val:
     means_arr = [float(np.mean(arr)) if len(arr) > 0 else np.nan for arr in box_data]
     ax.scatter(
@@ -738,7 +795,6 @@ def render_box_plot(
         label="Mean",
     )
 
-  # 标注中位数与/或均值数值
   y_min_cur, y_max_cur = ax.get_ylim()
   y_span_cur = max(y_max_cur - y_min_cur, 1e-6)
 
@@ -750,7 +806,6 @@ def render_box_plot(
     mean_v = float(np.mean(arr))
 
     if show_median_val and show_mean_val:
-      # 同时显示两者时，自动拉开垂直间距防止文字重叠
       min_gap = y_span_cur * 0.032
       y_med_txt = med_v
       y_mean_txt = mean_v
@@ -801,7 +856,6 @@ def render_box_plot(
           color="#1D4ED8",
       )
 
-  # 右侧留出余量，确保最后一个箱体右侧的数值不会被边框裁切
   if show_median_val or show_mean_val:
     ax.set_xlim(0.4, n_boxes + 0.95)
 
