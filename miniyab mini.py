@@ -202,19 +202,21 @@ if not selected_value_cols:
   st.warning("👈 请在左侧至少选择一列检测数值列。")
   st.stop()
 
-# ==================== 2. SPEC 规格设定 ====================
+# ==================== 2. SPEC 规格设定（抗尖峰干扰估算） ====================
 st.sidebar.header("2️⃣ SPEC 规格设定")
 dataset_key = f"{uploaded_file.name}::{selected_sheet}"
 cols_signature = tuple(selected_value_cols)
 
 
 def compute_recommended_spec(df_src, cols_sel, s_info):
+  """使用中位数与抗差标准差(MAD)估算 SPEC，避免编码器尖峰(如11205.01)带偏上下限"""
   vals = df_src[list(cols_sel)].to_numpy(dtype=float)
   valid_v = vals[~np.isnan(vals)]
   if len(valid_v) > 0:
     mid = float(np.median(valid_v))
-    spread = float(np.std(valid_v, ddof=1)) if len(valid_v) > 1 else 0.0
-    half_tol = max(round(spread * 4.0, 4), 0.3) if spread > 0 else 1.0
+    mad = float(np.median(np.abs(valid_v - mid)))
+    robust_std = mad * 1.4826 if mad > 0 else float(np.std(valid_v, ddof=1))
+    half_tol = max(round(robust_std * 4.5, 4), 0.2) if robust_std > 0 else 1.0
   else:
     mid, half_tol = 0.0, 1.0
 
@@ -305,8 +307,108 @@ if lsl >= usl:
   st.sidebar.error("⚠️ LSL 必须小于 USL！请修改或点击上方按钮重置。")
   st.stop()
 
-# ==================== 3. 全局统一数据屏蔽引擎 ====================
+# ==================== 3. 全局统一数据屏蔽引擎（单点传感器/编码器尖峰 + 行级过滤） ====================
 st.sidebar.header("3️⃣ 全局样本屏蔽")
+
+# --- 3A. 单点传感器/编码器错误读数屏蔽 ---
+spike_mode = st.sidebar.selectbox(
+    "单点极端尖峰屏蔽（传感器/编码器 Bug）",
+    options=[
+        "智能抗差识别（偏离中位数 N 倍 MAD）",
+        "按 SPEC 公差倍数识别（超出 Target ± N×公差）",
+        "自定义单点有效数值区间",
+        "不启用单点屏蔽",
+    ],
+    index=0,
+    help="专门过滤某行个别通道混入的编码器/传感器错误值（如 11205.01），避免拉歪整体均值与箱线图。",
+)
+
+df_work = df_raw.copy()
+sub_vals_raw = df_work[selected_value_cols].to_numpy(dtype=float)
+spike_outlier_mask = np.zeros_like(sub_vals_raw, dtype=bool)
+
+if spike_mode != "不启用单点屏蔽":
+  sp_c1, sp_c2 = st.sidebar.columns([1.15, 1.35])
+  if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
+    mad_mult = sp_c1.number_input(
+        "MAD 阈值倍数",
+        min_value=3.0,
+        max_value=200.0,
+        value=15.0,
+        step=1.0,
+        help="越小越严格；15 倍可精准抓出编码器跳变而不误伤正常波动。",
+    )
+    valid_flat = sub_vals_raw[~np.isnan(sub_vals_raw)]
+    if len(valid_flat) > 0:
+      med_all = float(np.median(valid_flat))
+      mad_all = float(np.median(np.abs(valid_flat - med_all)))
+      robust_sigma = mad_all * 1.4826
+      if robust_sigma <= 1e-12:
+        q75, q25 = np.percentile(valid_flat, [75, 25])
+        robust_sigma = max((q75 - q25) / 1.349, (usl - lsl) / 6.0, 1e-6)
+      low_bound = med_all - mad_mult * robust_sigma
+      high_bound = med_all + mad_mult * robust_sigma
+      spike_outlier_mask = (~np.isnan(sub_vals_raw)) & (
+          (sub_vals_raw < low_bound) | (sub_vals_raw > high_bound)
+      )
+  elif spike_mode == "按 SPEC 公差倍数识别（超出 Target ± N×公差）":
+    spec_mult = sp_c1.number_input(
+        "公差跨度倍数",
+        min_value=1.0,
+        max_value=50.0,
+        value=3.0,
+        step=0.5,
+    )
+    spec_span = usl - lsl
+    low_bound = target - spec_mult * spec_span
+    high_bound = target + spec_mult * spec_span
+    spike_outlier_mask = (~np.isnan(sub_vals_raw)) & (
+        (sub_vals_raw < low_bound) | (sub_vals_raw > high_bound)
+    )
+  else:
+    pt_min = sp_c1.number_input(
+        "单点最小值", value=float(lsl - (usl - lsl)), format="%.4f"
+    )
+    pt_max = sp_c2.number_input(
+        "单点最大值", value=float(usl + (usl - lsl)), format="%.4f"
+    )
+    spike_outlier_mask = (~np.isnan(sub_vals_raw)) & (
+        (sub_vals_raw < pt_min) | (sub_vals_raw > pt_max)
+    )
+
+  if spike_mode != "自定义单点有效数值区间":
+    spike_action = sp_c2.selectbox(
+        "异常点处理方式",
+        options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
+        index=0,
+    )
+  else:
+    spike_action = st.sidebar.selectbox(
+        "异常点处理方式",
+        options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
+        index=0,
+    )
+else:
+  spike_action = "置空该单元格（保留行内其他列）"
+
+masked_cell_count = int(np.sum(spike_outlier_mask))
+rows_with_spike_mask = np.any(spike_outlier_mask, axis=1)
+
+if masked_cell_count > 0:
+  if spike_action == "置空该单元格（保留行内其他列）":
+    cleaned_vals = sub_vals_raw.copy()
+    cleaned_vals[spike_outlier_mask] = np.nan
+    for idx_c, col in enumerate(selected_value_cols):
+      df_work[col] = cleaned_vals[:, idx_c]
+    st.sidebar.caption(
+        f"🛡️ 已自动置空 **{masked_cell_count}** 个传感器/编码器异常单元格"
+    )
+  else:
+    st.sidebar.caption(
+        f"🛡️ 已标记 **{int(np.sum(rows_with_spike_mask))}** 行含异常单点的数据行待剔除"
+    )
+
+# --- 3B. 行号区间与行均值筛选 ---
 exclude_ranges_str = st.sidebar.text_input(
     "屏蔽行号区间（支持多段）",
     value="",
@@ -354,12 +456,16 @@ filter_mode = st.sidebar.selectbox(
     index=1,
 )
 
-row_mean = df_raw[selected_value_cols].mean(axis=1)
-df_work = df_raw.copy()
+row_mean = df_work[selected_value_cols].mean(axis=1)
 df_work["_Row_Mean_"] = row_mean
 
 mask_not_nan = df_work["_Row_Mean_"].notna()
 mask_not_in_range = ~df_work["Row_Index"].isin(excluded_rows_set)
+mask_no_spike_row = (
+    pd.Series(~rows_with_spike_mask, index=df_work.index)
+    if (masked_cell_count > 0 and spike_action == "剔除包含异常点的整行")
+    else pd.Series(True, index=df_work.index)
+)
 mask_value_ok = pd.Series(True, index=df_work.index)
 
 if filter_mode == "按 SPEC 范围过滤（超出 [LSL, USL] 屏蔽）":
@@ -379,9 +485,11 @@ elif filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
       df_work["_Row_Mean_"] <= custom_max
   )
 
-valid_mask = mask_not_nan & mask_not_in_range & mask_value_ok
+valid_mask = (
+    mask_not_nan & mask_not_in_range & mask_no_spike_row & mask_value_ok
+)
 df_clean = df_work[valid_mask].copy().reset_index(drop=True)
-df_removed = df_work[~valid_mask].copy().reset_index(drop=True)
+df_removed = df_raw[~valid_mask].copy().reset_index(drop=True)
 
 raw_sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
 raw_all_valid_vals = raw_sub_matrix[~np.isnan(raw_sub_matrix)]
@@ -510,11 +618,12 @@ exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
 # ==================== 右侧主工作区：顶部概览与紧凑标题栏 ====================
 st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
 
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("原始数据行数", len(df_work))
 m2.metric("有效分析行数", len(df_clean))
-m3.metric("已全局屏蔽行数", len(df_removed))
-m4.metric("总样本数 N", len(all_valid_vals))
+m3.metric("已整行屏蔽数", len(df_removed))
+m4.metric("已屏蔽异常单点", masked_cell_count)
+m5.metric("总有效样本 N", len(all_valid_vals))
 
 top_bar1, top_bar2 = st.columns([3.5, 1.2])
 with top_bar1:
@@ -607,7 +716,9 @@ def save_fig_with_border(fig, use_tight=False):
           clip_on=False,
       )
       fig.patches.append(border_rect)
-    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in)
+    fig.savefig(
+        buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in
+    )
   else:
     if show_outer_border:
       fig.patch.set_edgecolor("#A6A6A6")
@@ -635,7 +746,6 @@ ASPECT_OPTIONS = [
 
 
 def render_aspect_selector(container_col, key_prefix, default_idx=0):
-  """为单张图表渲染独立的比例选择器，返回 (fig_w, fig_h, preview_px_width)"""
   preset = container_col.selectbox(
       "图像比例",
       options=ASPECT_OPTIONS,
