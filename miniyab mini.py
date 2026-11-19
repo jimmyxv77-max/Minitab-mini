@@ -91,16 +91,71 @@ if uploaded_file is None:
   st.stop()
 
 
+def read_csv_compatible(file_bytes):
+  """自动兼容 UTF-8 / GB18030 / GBK / Big5 及不同分隔符的 CSV 文件"""
+  encodings = ["utf-8-sig", "utf-8", "gb18030", "gbk", "big5"]
+  last_err = None
+  for enc in encodings:
+    try:
+      df = pd.read_csv(
+          io.BytesIO(file_bytes),
+          encoding=enc,
+          sep=None,
+          engine="python",
+      )
+      if df is not None and not df.empty:
+        return df
+    except UnicodeDecodeError as e:
+      last_err = e
+      continue
+    except Exception:
+      try:
+        df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
+        if df is not None and not df.empty:
+          return df
+      except Exception as e2:
+        last_err = e2
+        continue
+
+  # 兜底：若存在个别损坏字节，使用替换模式避免整个文件读取失败
+  try:
+    text_fallback = file_bytes.decode("gb18030", errors="replace")
+    return pd.read_csv(io.StringIO(text_fallback), sep=None, engine="python")
+  except Exception:
+    raise last_err if last_err else ValueError("无法解析 CSV 文件")
+
+
 @st.cache_data
 def load_workbook_sheets(file_bytes, filename):
-  if filename.lower().endswith(".csv"):
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    return {"CSV_Data": df}
-  xls = pd.ExcelFile(io.BytesIO(file_bytes))
-  return {name: xls.parse(name) for name in xls.sheet_names}
+  lower_name = filename.lower()
+  if lower_name.endswith(".csv"):
+    df = read_csv_compatible(file_bytes)
+    sheet_label = os.path.splitext(filename)[0] or "CSV_Data"
+    return {sheet_label: df}
+
+  engine = "openpyxl" if lower_name.endswith(".xlsx") else None
+  xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+  result = {}
+  for name in xls.sheet_names:
+    try:
+      part_df = xls.parse(name)
+      if part_df is not None and not part_df.dropna(how="all").empty:
+        result[name] = part_df
+    except Exception:
+      continue
+  if not result:
+    result[xls.sheet_names[0]] = pd.DataFrame()
+  return result
 
 
-sheets_dict = load_workbook_sheets(uploaded_file.getvalue(), uploaded_file.name)
+try:
+  sheets_dict = load_workbook_sheets(
+      uploaded_file.getvalue(), uploaded_file.name
+  )
+except Exception as exc:
+  st.error(f"❌ 文件读取失败，请检查文件格式或编码：{exc}")
+  st.stop()
+
 selected_sheet = st.sidebar.selectbox(
     "工作表 (Sheet)", list(sheets_dict.keys())
 )
@@ -310,7 +365,6 @@ if lsl >= usl:
 # ==================== 3. 全局统一数据屏蔽引擎（单点传感器/编码器尖峰 + 行级过滤） ====================
 st.sidebar.header("3️⃣ 全局样本屏蔽")
 
-# --- 3A. 单点传感器/编码器错误读数屏蔽 ---
 spike_mode = st.sidebar.selectbox(
     "单点极端尖峰屏蔽（传感器/编码器 Bug）",
     options=[
@@ -408,7 +462,6 @@ if masked_cell_count > 0:
         f"🛡️ 已标记 **{int(np.sum(rows_with_spike_mask))}** 行含异常单点的数据行待剔除"
     )
 
-# --- 3B. 行号区间与行均值筛选 ---
 exclude_ranges_str = st.sidebar.text_input(
     "屏蔽行号区间（支持多段）",
     value="",
@@ -690,7 +743,6 @@ final_title_mean = (
 
 # ==================== 统一图像浅灰色外边框封装 ====================
 def save_fig_with_border(fig, use_tight=False):
-  """保存图像为 PNG 字节流；启用边框时自动绘制与内容完美贴合的浅灰色外框"""
   fig.patch.set_facecolor("white")
   buf = io.BytesIO()
   if use_tight:
