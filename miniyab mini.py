@@ -314,6 +314,7 @@ selected_projects = st.sidebar.multiselect(
     "待生成项目 / 参数组（已自动排除日期/编号等列）",
     options=available_proj_names,
     default=draft_default,
+    key=f"ms_draft_projects_{dataset_key}",
     help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新图表」，避免非检测列拖慢操作。",
 )
 st.session_state["draft_projects"] = selected_projects
@@ -330,12 +331,22 @@ with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=Fals
       proj_map[p_name] = updated_cols
 
   new_grp_name = st.text_input(
-      "新增自定义项目组名称", value="", placeholder="例如: 涂宽+白边对比"
+      "新增自定义项目组名称",
+      value="",
+      placeholder="例如: 涂宽+白边对比",
+      key=f"new_grp_name_{dataset_key}",
   )
   new_grp_cols = st.multiselect(
-      "选择新增项目组通道列", options=numeric_cols_all, default=[]
+      "选择新增项目组通道列",
+      options=numeric_cols_all,
+      default=[],
+      key=f"new_grp_cols_{dataset_key}",
   )
-  if st.button("➕ 添加项目组", use_container_width=True):
+  if st.button(
+      "➕ 添加项目组",
+      key=f"btn_add_grp_{dataset_key}",
+      use_container_width=True,
+  ):
     if new_grp_name.strip() and new_grp_cols:
       g_clean = new_grp_name.strip()
       proj_map[g_clean] = list(new_grp_cols)
@@ -343,9 +354,9 @@ with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=Fals
         st.session_state["draft_projects"].append(g_clean)
       st.rerun()
 
-# 显式“生成 / 更新图表”按钮
 generate_clicked = st.sidebar.button(
     "🚀 生成 / 更新所选项目图表",
+    key=f"btn_gen_charts_{dataset_key}",
     type="primary",
     use_container_width=True,
 )
@@ -409,7 +420,7 @@ current_focus_proj = st.sidebar.selectbox(
     "当前编辑 SPEC 的项目",
     options=confirmed_projects,
     index=0,
-    key="focus_spec_proj",
+    key=f"focus_spec_proj_{dataset_key}",
 )
 focus_key = f"{dataset_key}::{current_focus_proj}"
 cur_spec = specs_map[focus_key]
@@ -445,7 +456,9 @@ specs_map[focus_key] = {
 }
 
 if st.sidebar.button(
-    f"🔄 重新自动估算 [{current_focus_proj}] SPEC", use_container_width=True
+    f"🔄 重新自动估算 [{current_focus_proj}] SPEC",
+    key=f"btn_reest_spec_{focus_key}",
+    use_container_width=True,
 ):
   rl, rt, ru = compute_recommended_spec(
       df_raw, proj_map[current_focus_proj], spec_info
@@ -492,6 +505,7 @@ spike_mode = st.sidebar.selectbox(
         "不启用单点屏蔽",
     ],
     index=0,
+    key=f"spike_mode_{dataset_key}",
     help="专门过滤某行个别通道混入的编码器/传感器错误值，避免拉歪整体均值与箱线图。",
 )
 
@@ -500,35 +514,54 @@ pt_min_val, pt_max_val = None, None
 if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
   sp_c1, sp_c2 = st.sidebar.columns([1.15, 1.35])
   spike_param_val = sp_c1.number_input(
-      "MAD 阈值倍数", min_value=3.0, max_value=200.0, value=15.0, step=1.0
+      "MAD 阈值倍数",
+      min_value=3.0,
+      max_value=200.0,
+      value=15.0,
+      step=1.0,
+      key=f"mad_mult_{dataset_key}",
   )
   spike_action = sp_c2.selectbox(
       "异常点处理方式",
       options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
       index=0,
+      key=f"sp_act_mad_{dataset_key}",
   )
 elif spike_mode == "按各项目 SPEC 公差倍数识别":
   sp_c1, sp_c2 = st.sidebar.columns([1.15, 1.35])
   spike_param_val = sp_c1.number_input(
-      "公差跨度倍数", min_value=1.0, max_value=50.0, value=3.0, step=0.5
+      "公差跨度倍数",
+      min_value=1.0,
+      max_value=50.0,
+      value=3.0,
+      step=0.5,
+      key=f"tol_mult_{dataset_key}",
   )
   spike_action = sp_c2.selectbox(
       "异常点处理方式",
       options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
       index=0,
+      key=f"sp_act_tol_{dataset_key}",
   )
 elif spike_mode == "自定义单点有效数值区间":
   sp_c1, sp_c2 = st.sidebar.columns(2)
   pt_min_val = sp_c1.number_input(
-      "单点最小值", value=float(f_lsl - (f_usl - f_lsl)), format="%.4f"
+      "单点最小值",
+      value=float(f_lsl - (f_usl - f_lsl)),
+      format="%.4f",
+      key=f"pt_min_{dataset_key}",
   )
   pt_max_val = sp_c2.number_input(
-      "单点最大值", value=float(f_usl + (f_usl - f_lsl)), format="%.4f"
+      "单点最大值",
+      value=float(f_usl + (f_usl - f_lsl)),
+      format="%.4f",
+      key=f"pt_max_{dataset_key}",
   )
-  spike_action = st.sidebar.selectbox(
+  spike_action = sp_c2.selectbox(
       "异常点处理方式",
       options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
       index=0,
+      key=f"sp_act_rng_{dataset_key}",
   )
 else:
   spike_action = "置空该单元格（保留行内其他列）"
@@ -537,6 +570,7 @@ exclude_ranges_str = st.sidebar.text_input(
     "屏蔽行号区间（支持多段）",
     value="",
     placeholder="例如: 1-250, 600-630",
+    key=f"excl_rows_{dataset_key}",
     help="剔除指定原始行号范围（1开始），同步作用于全套图表与导出明细。",
 )
 
@@ -578,16 +612,23 @@ filter_mode = st.sidebar.selectbox(
         "按自定义范围过滤（超出设定区间屏蔽）",
     ],
     index=1,
+    key=f"filter_mode_{dataset_key}",
 )
 
 custom_min, custom_max = None, None
 if filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
   c_min, c_max = st.sidebar.columns(2)
   custom_min = c_min.number_input(
-      "允许最小值", value=float(f_lsl), format="%.4f"
+      "允许最小值",
+      value=float(f_lsl),
+      format="%.4f",
+      key=f"c_min_{dataset_key}",
   )
   custom_max = c_max.number_input(
-      "允许最大值", value=float(f_usl), format="%.4f"
+      "允许最大值",
+      value=float(f_usl),
+      format="%.4f",
+      key=f"c_max_{dataset_key}",
   )
   if custom_min >= custom_max:
     st.sidebar.error("⚠️ 最小值必须小于最大值！")
@@ -618,14 +659,18 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
       "校准作用项目",
       options=["当前聚焦项目"] + confirmed_projects,
       index=0,
+      key=f"sig_proj_{dataset_key}",
   )
   enable_sigma_tuning = st.checkbox(
-      "启用西格玛美化校准（全图与导出表同步）", value=False
+      "启用西格玛美化校准（全图与导出表同步）",
+      value=False,
+      key=f"en_sig_{dataset_key}",
   )
   tuning_mode = st.radio(
       "校准方式",
       options=["直接指定目标西格玛 (σ)", "按目标 CPK 自动推算西格玛"],
       index=0,
+      key=f"tun_mode_{dataset_key}",
   )
   center_align_pct = st.slider(
       "均值向 Target 居中比例 (%)",
@@ -633,6 +678,7 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
       max_value=100,
       value=0,
       step=5,
+      key=f"ctr_pct_{dataset_key}",
   )
   if tuning_mode == "直接指定目标西格玛 (σ)":
     manual_target_sigma = st.number_input(
@@ -640,6 +686,7 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
         min_value=0.000001,
         value=0.020000,
         format="%.6f",
+        key=f"man_sig_{dataset_key}",
     )
     target_cpk_goal = 1.33
   else:
@@ -648,6 +695,7 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
         "目标 CPK 标准",
         options=[1.33, 1.50, 1.67, 2.00],
         index=0,
+        key=f"tgt_cpk_{dataset_key}",
     )
 
 
@@ -867,7 +915,9 @@ with top_bar1:
       expanded=False,
   ):
     title_target_proj = st.selectbox(
-        "选择要自定义标题的项目", options=ready_projects, key="title_proj_sel"
+        "选择要自定义标题的项目",
+        options=ready_projects,
+        key=f"title_proj_sel_{dataset_key}",
     )
     k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(title_target_proj)
     t_c1, t_c2 = st.columns(2)
@@ -892,6 +942,7 @@ with top_bar2:
   show_outer_border = st.checkbox(
       "🖼️ 图像浅灰外边框",
       value=True,
+      key=f"show_border_{dataset_key}",
       help="为导出图片添加浅灰色矩形边框，方便粘贴至 PPT 多图排版对齐",
   )
 
@@ -972,7 +1023,7 @@ def render_aspect_selector(container_col, key_prefix, default_idx=0):
       "图像比例",
       options=ASPECT_OPTIONS,
       index=default_idx,
-      key=f"{key_prefix}_aspect_preset",
+      key=f"{key_prefix}_{dataset_key}_aspect_preset",
   )
   if preset == "4 : 3（PPT 多图/四宫格）":
     fw, fh = 9.6, 7.2
@@ -990,7 +1041,7 @@ def render_aspect_selector(container_col, key_prefix, default_idx=0):
         max_value=30.0,
         value=4.0,
         step=0.5,
-        key=f"{key_prefix}_rw",
+        key=f"{key_prefix}_{dataset_key}_rw",
     )
     rh = sub_c2.number_input(
         "高比",
@@ -998,7 +1049,7 @@ def render_aspect_selector(container_col, key_prefix, default_idx=0):
         max_value=30.0,
         value=3.0,
         step=0.5,
-        key=f"{key_prefix}_rh",
+        key=f"{key_prefix}_{dataset_key}_rh",
     )
     fh = 7.0
     fw = float(np.clip(fh * (rw / rh), 6.5, 16.0))
@@ -1579,84 +1630,6 @@ def render_excel_style_row_mean_plot(
   return save_fig_with_border(fig, use_tight=True)
 
 
-# ==================== 顶部栏：标题、浅灰外边框开关与多项目一键 ZIP 打包 ====================
-st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
-
-
-def default_titles_for_project(p_name):
-  return (
-      f"{p_name} — Process Capability Report",
-      f"{p_name} — Box Plot",
-      f"{p_name} — Time Series Plot",
-      f"{p_name}均值",
-  )
-
-
-def ensure_project_title_keys(p_name):
-  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
-  k_cap = f"t_cap_{dataset_key}_{p_name}"
-  k_box = f"t_box_{dataset_key}_{p_name}"
-  k_ts = f"t_ts_{dataset_key}_{p_name}"
-  k_mean = f"t_mean_{dataset_key}_{p_name}"
-  st.session_state.setdefault(k_cap, d_cap)
-  st.session_state.setdefault(k_box, d_box)
-  st.session_state.setdefault(k_ts, d_ts)
-  st.session_state.setdefault(k_mean, d_mean)
-  return k_cap, k_box, k_ts, k_mean
-
-
-top_bar1, top_bar2 = st.columns([3.5, 1.2])
-with top_bar1:
-  with st.expander(
-      "✏️ 自定义各项目图表主标题（默认保留标准后缀，特殊情况可直接删改）",
-      expanded=False,
-  ):
-    title_target_proj = st.selectbox(
-        "选择要自定义标题的项目", options=ready_projects, key="title_proj_sel"
-    )
-    k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(title_target_proj)
-    t_c1, t_c2 = st.columns(2)
-    t_c1.text_input("能力报告标题", key=k_cap)
-    t_c2.text_input("箱线图标题", key=k_box)
-    t_c3, t_c4 = st.columns(2)
-    t_c3.text_input("时间序列图标题", key=k_ts)
-    t_c4.text_input("单行均值图标题", key=k_mean)
-
-    if st.button(
-        f"↩️ 恢复 [{title_target_proj}] 默认标准后缀标题",
-        key=f"reset_titles_{dataset_key}_{title_target_proj}",
-    ):
-      d_cap, d_box, d_ts, d_mean = default_titles_for_project(title_target_proj)
-      st.session_state[k_cap] = d_cap
-      st.session_state[k_box] = d_box
-      st.session_state[k_ts] = d_ts
-      st.session_state[k_mean] = d_mean
-      st.rerun()
-
-with top_bar2:
-  show_outer_border = st.checkbox(
-      "🖼️ 图像浅灰外边框",
-      value=True,
-      help="为导出图片添加浅灰色矩形边框，方便粘贴至 PPT 多图排版对齐",
-  )
-
-
-def get_project_titles(p_name):
-  """严格按输入框当前值生成标题；若用户主动留空，则回退该项目的默认标准后缀"""
-  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
-  k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(p_name)
-  v_cap = str(st.session_state.get(k_cap, "")).strip()
-  v_box = str(st.session_state.get(k_box, "")).strip()
-  v_ts = str(st.session_state.get(k_ts, "")).strip()
-  v_mean = str(st.session_state.get(k_mean, "")).strip()
-  return (
-      v_cap if v_cap else d_cap,
-      v_box if v_box else d_box,
-      v_ts if v_ts else d_ts,
-      v_mean if v_mean else d_mean,
-  )
-
-
 # ==================== 多项目汇总表与一键打包 ZIP ====================
 summary_rows = []
 for p_name in ready_projects:
@@ -1712,6 +1685,7 @@ if len(ready_projects) > 1:
       data=zip_buf,
       file_name=f"{safe_sheet}_多项目SPC图表包.zip",
       mime="application/zip",
+      key=f"dl_zip_{dataset_key}",
   )
 
 # ==================== 按项目分标签页展示全套图表与导出 ====================
@@ -1746,22 +1720,29 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           data=buf_cap,
           file_name=f"{safe_prefix}_CPK.png",
           mime="image/png",
-          key=f"dl_cap_{p_name}",
+          key=f"dl_cap_{dataset_key}_{p_name}",
       )
 
     with tab_box:
       bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 1.2, 1.3, 0.9, 1.6])
       show_box_median = bc1.checkbox(
-          "显示中位数 (Median)", value=True, key=f"bmed_{p_name}"
+          "显示中位数 (Median)",
+          value=True,
+          key=f"bmed_{dataset_key}_{p_name}",
       )
       show_box_mean = bc2.checkbox(
-          "显示均值 (Mean)", value=False, key=f"bmean_{p_name}"
+          "显示均值 (Mean)", value=False, key=f"bmean_{dataset_key}_{p_name}"
       )
       show_box_outliers = bc3.checkbox(
-          "显示异常点 (Outliers)", value=False, key=f"bout_{p_name}"
+          "显示异常点 (Outliers)",
+          value=False,
+          key=f"bout_{dataset_key}_{p_name}",
       )
       box_decimals = bc4.selectbox(
-          "小数位", options=[2, 3, 4, 5, 6], index=2, key=f"bdec_{p_name}"
+          "小数位",
+          options=[2, 3, 4, 5, 6],
+          index=2,
+          key=f"bdec_{dataset_key}_{p_name}",
       )
       box_w, box_h, box_px = render_aspect_selector(
           bc5, f"box_{p_name}", default_idx=0
@@ -1784,7 +1765,7 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           data=buf_box,
           file_name=f"{safe_prefix}_BoxPlot.png",
           mime="image/png",
-          key=f"dl_box_{p_name}",
+          key=f"dl_box_{dataset_key}_{p_name}",
       )
 
     with tab_ts:
@@ -1793,13 +1774,13 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           "X轴序号",
           options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
           index=0,
-          key=f"ts_x_{p_name}",
+          key=f"ts_x_{dataset_key}_{p_name}",
       )
       ts_y_mode = tc2.selectbox(
           "Y轴尺度",
           options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
           index=0,
-          key=f"ts_y_{p_name}",
+          key=f"ts_y_{dataset_key}_{p_name}",
       )
       d_ymin, d_ymax = float(np.min(all_v)), float(np.max(all_v))
       pad = max((d_ymax - d_ymin) * 0.1, 0.02)
@@ -1809,13 +1790,13 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
             "Y-Min",
             value=round(d_ymin - pad, 4),
             format="%.4f",
-            key=f"ts_ymin_{p_name}",
+            key=f"ts_ymin_{dataset_key}_{p_name}",
         )
         ts_ymax = tc4.number_input(
             "Y-Max",
             value=round(d_ymax + pad, 4),
             format="%.4f",
-            key=f"ts_ymax_{p_name}",
+            key=f"ts_ymax_{dataset_key}_{p_name}",
         )
       ts_w, ts_h, ts_px = render_aspect_selector(
           tc5, f"ts_{p_name}", default_idx=3
@@ -1831,7 +1812,7 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           data=buf_ts,
           file_name=f"{safe_prefix}_TimeSeries.png",
           mime="image/png",
-          key=f"dl_ts_{p_name}",
+          key=f"dl_ts_{dataset_key}_{p_name}",
       )
 
     with tab_mean:
@@ -1840,13 +1821,13 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           "X轴序号",
           options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
           index=0,
-          key=f"mean_x_{p_name}",
+          key=f"mean_x_{dataset_key}_{p_name}",
       )
       mean_y_mode = mc2.selectbox(
           "Y轴尺度",
           options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
           index=0,
-          key=f"mean_y_{p_name}",
+          key=f"mean_y_{dataset_key}_{p_name}",
       )
       mean_ymin, mean_ymax = None, None
       if mean_y_mode == "自定义范围 (Manual)":
@@ -1855,13 +1836,13 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
             "Y-Min",
             value=round(p_lsl - 0.5 * spec_span, 4),
             format="%.4f",
-            key=f"mean_ymin_{p_name}",
+            key=f"mean_ymin_{dataset_key}_{p_name}",
         )
         mean_ymax = mc4.number_input(
             "Y-Max",
             value=round(p_usl + 0.25 * spec_span, 4),
             format="%.4f",
-            key=f"mean_ymax_{p_name}",
+            key=f"mean_ymax_{dataset_key}_{p_name}",
         )
       mean_w, mean_h, mean_px = render_aspect_selector(
           mc5, f"mean_{p_name}", default_idx=3
@@ -1877,7 +1858,7 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           data=buf_mean,
           file_name=f"{safe_prefix}_RowMean_Trend.png",
           mime="image/png",
-          key=f"dl_mean_{p_name}",
+          key=f"dl_mean_{dataset_key}_{p_name}",
       )
 
     with tab_data:
@@ -1893,7 +1874,7 @@ for p_tab, p_name in zip(proj_tabs, ready_projects):
           data=excel_buf,
           file_name=f"{safe_prefix}_Filtered.xlsx",
           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          key=f"dl_xlsx_{p_name}",
+          key=f"dl_xlsx_{dataset_key}_{p_name}",
       )
       sub_t1, sub_t2 = st.tabs(
           ["有效数据 (Valid)", "被屏蔽异常行 (Filtered Out)"]
