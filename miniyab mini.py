@@ -3,6 +3,7 @@ import os
 import re
 import urllib.request
 import matplotlib.font_manager as fm
+from matplotlib.patches import Rectangle
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -515,33 +516,42 @@ m2.metric("有效分析行数", len(df_clean))
 m3.metric("已全局屏蔽行数", len(df_removed))
 m4.metric("总样本数 N", len(all_valid_vals))
 
-with st.expander("✏️ 自定义项目名称与各图表主标题（点击展开）", expanded=False):
-  t_col0, t_col1, t_col2 = st.columns(3)
-  base_topic_name = t_col0.text_input(
-      "项目 / 检测参数名称（自动同步至各图）",
-      value=selected_sheet,
-      placeholder="例如: Coating density of single side",
-  )
-  custom_title_cap = t_col1.text_input(
-      "能力报告标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name} — Process Capability Report",
-  )
-  custom_title_box = t_col2.text_input(
-      "箱线图标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name} — Box Plot",
-  )
-  t_col3, t_col4 = st.columns(2)
-  custom_title_ts = t_col3.text_input(
-      "时间序列图标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name} — Time Series Plot",
-  )
-  custom_title_mean = t_col4.text_input(
-      "单行均值图标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name}均值",
+top_bar1, top_bar2 = st.columns([3.5, 1.2])
+with top_bar1:
+  with st.expander("✏️ 自定义项目名称与各图表主标题（点击展开）", expanded=False):
+    t_col0, t_col1, t_col2 = st.columns(3)
+    base_topic_name = t_col0.text_input(
+        "项目 / 检测参数名称（自动同步至各图）",
+        value=selected_sheet,
+        placeholder="例如: Coating width A",
+    )
+    custom_title_cap = t_col1.text_input(
+        "能力报告标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name} — Process Capability Report",
+    )
+    custom_title_box = t_col2.text_input(
+        "箱线图标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name} — Box Plot",
+    )
+    t_col3, t_col4 = st.columns(2)
+    custom_title_ts = t_col3.text_input(
+        "时间序列图标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name} — Time Series Plot",
+    )
+    custom_title_mean = t_col4.text_input(
+        "单行均值图标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name}均值",
+    )
+
+with top_bar2:
+  show_outer_border = st.checkbox(
+      "🖼️ 图像浅灰外边框",
+      value=True,
+      help="为导出图片添加浅灰色矩形边框，方便粘贴至 PPT 多图排版对齐",
   )
 
 topic_clean = (
@@ -567,6 +577,51 @@ final_title_mean = (
     if custom_title_mean.strip()
     else f"{topic_clean}均值"
 )
+
+
+# ==================== 统一图像浅灰色外边框封装 ====================
+def save_fig_with_border(fig, use_tight=False):
+  """保存图像为 PNG 字节流；启用边框时自动绘制与内容完美贴合的浅灰色外框"""
+  fig.patch.set_facecolor("white")
+  buf = io.BytesIO()
+  if use_tight:
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bbox_in = fig.get_tightbbox(renderer)
+    pad_in = 0.14
+    fig_w_in, fig_h_in = fig.get_size_inches()
+    if show_outer_border and bbox_in is not None:
+      x0 = (bbox_in.x0 - pad_in) / fig_w_in
+      y0 = (bbox_in.y0 - pad_in) / fig_h_in
+      w_norm = (bbox_in.width + 2 * pad_in) / fig_w_in
+      h_norm = (bbox_in.height + 2 * pad_in) / fig_h_in
+      border_rect = Rectangle(
+          (x0, y0),
+          w_norm,
+          h_norm,
+          transform=fig.transFigure,
+          fill=False,
+          edgecolor="#A6A6A6",
+          linewidth=1.2,
+          zorder=100,
+          clip_on=False,
+      )
+      fig.patches.append(border_rect)
+    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in)
+  else:
+    if show_outer_border:
+      fig.patch.set_edgecolor("#A6A6A6")
+      fig.patch.set_linewidth(2.2)
+    fig.savefig(
+        buf,
+        format="png",
+        dpi=170,
+        facecolor=fig.get_facecolor(),
+        edgecolor=fig.get_edgecolor(),
+    )
+  buf.seek(0)
+  plt.close(fig)
+  return buf
 
 
 # ==================== 独立图表比例选择器组件 ====================
@@ -623,7 +678,6 @@ def render_aspect_selector(container_col, key_prefix, default_idx=0):
 # ==================== 图表渲染函数（自适应画布比例） ====================
 def render_capability_plot(w_in, h_in):
   fig = plt.figure(figsize=(w_in, h_in), dpi=170)
-  fig.patch.set_facecolor("white")
 
   scale_f = min(w_in / 9.6, h_in / 7.2)
   font_panel = max(7.2, 8.3 * scale_f)
@@ -822,16 +876,12 @@ def render_capability_plot(w_in, h_in):
       final_title_cap,
       fontsize=font_title,
       fontweight="bold",
-      y=0.965,
+      y=0.96,
       fontproperties=FONT_PROP,
   )
-  plt.subplots_adjust(left=0.02, right=0.98, top=0.84, bottom=0.04)
+  plt.subplots_adjust(left=0.025, right=0.975, top=0.835, bottom=0.045)
 
-  buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=170)
-  buf.seek(0)
-  plt.close(fig)
-  return buf
+  return save_fig_with_border(fig, use_tight=False)
 
 
 def render_box_plot(
@@ -843,7 +893,6 @@ def render_box_plot(
     decimals=4,
 ):
   fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-  fig.patch.set_facecolor("white")
 
   box_data = [
       df_clean[c].dropna().to_numpy(dtype=float) for c in selected_value_cols
@@ -969,6 +1018,11 @@ def render_box_plot(
       fontweight="bold",
   )
 
+  for sp in ("top", "right", "left", "bottom"):
+    ax.spines[sp].set_color("#BFBFBF")
+    ax.spines[sp].set_linewidth(0.8)
+    ax_r.spines[sp].set_visible(False)
+
   ax.set_title(
       final_title_box,
       fontsize=max(11.5, 13.5 * width_scale),
@@ -983,20 +1037,15 @@ def render_box_plot(
   for lbl in ax.get_xticklabels():
     lbl.set_fontproperties(FONT_PROP)
   ax.grid(True, ls=":", alpha=0.45)
-  plt.tight_layout()
+  plt.tight_layout(pad=1.2)
 
-  buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=170)
-  buf.seek(0)
-  plt.close(fig)
-  return buf
+  return save_fig_with_border(fig, use_tight=False)
 
 
 def render_time_series_plot(
     w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
 ):
   fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-  fig.patch.set_facecolor("white")
 
   if x_mode_opt == "保留原始表格行号 (Row Index)":
     x_seq = df_clean["Row_Index"].to_numpy(dtype=int)
@@ -1072,13 +1121,8 @@ def render_time_series_plot(
     )
     leg.get_title().set_fontsize(8.8)
 
-  plt.tight_layout()
-
-  buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
-  buf.seek(0)
-  plt.close(fig)
-  return buf
+  plt.tight_layout(pad=1.0)
+  return save_fig_with_border(fig, use_tight=True)
 
 
 def render_excel_style_row_mean_plot(
@@ -1086,7 +1130,6 @@ def render_excel_style_row_mean_plot(
 ):
   """复刻经典 Excel 折线图风格的单行均值趋势图"""
   fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-  fig.patch.set_facecolor("white")
   ax.set_facecolor("white")
 
   if x_mode_opt == "保留原始表格行号 (Row Index)":
@@ -1190,13 +1233,8 @@ def render_excel_style_row_mean_plot(
   for text in leg.get_texts():
     text.set_color("#595959")
 
-  plt.tight_layout()
-
-  buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
-  buf.seek(0)
-  plt.close(fig)
-  return buf
+  plt.tight_layout(pad=1.0)
+  return save_fig_with_border(fig, use_tight=True)
 
 
 # ==================== 独立分标签页（每张图独立控制比例与交互选项） ====================
