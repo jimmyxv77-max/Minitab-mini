@@ -238,6 +238,35 @@ if not measurement_candidates:
   measurement_candidates = numeric_cols_all
 
 
+def is_likely_non_measurement(name_str):
+  """识别常见非质量检测数值列（日期、时间、编号、EA号、速度、走带距离等）"""
+  s = str(name_str).strip().lower()
+  non_meas_tokens = [
+      "日期",
+      "时间",
+      "date",
+      "time",
+      "timestamp",
+      "ea号",
+      "编号",
+      "序号",
+      "工单",
+      "卷号",
+      "批次",
+      "id",
+      "no",
+      "code",
+      "速度",
+      "speed",
+      "走带",
+      "长度",
+      "米数",
+      "meter",
+      "len",
+  ]
+  return any(tok in s for tok in non_meas_tokens)
+
+
 def infer_parameter_groups(cols):
   """按列名末尾数字/分隔符自动聚合成参数组（如 涂宽1..5 -> 涂宽）"""
   groups = {}
@@ -255,6 +284,9 @@ def infer_parameter_groups(cols):
 
 
 group_order, inferred_groups = infer_parameter_groups(measurement_candidates)
+suggested_default_groups = [
+    g for g in group_order if not is_likely_non_measurement(g)
+]
 
 dataset_key = f"{uploaded_file.name}::{selected_sheet}"
 if st.session_state.get("active_dataset_key") != dataset_key:
@@ -262,34 +294,29 @@ if st.session_state.get("active_dataset_key") != dataset_key:
   st.session_state["project_groups_map"] = {
       k: list(v) for k, v in inferred_groups.items()
   }
-  st.session_state["selected_projects"] = list(group_order)
+  st.session_state["draft_projects"] = list(suggested_default_groups)
+  st.session_state["confirmed_projects"] = list(suggested_default_groups)
+  st.session_state["charts_generated"] = True
   st.session_state["project_specs_map"] = {}
 
-if "project_groups_map" not in st.session_state:
-  st.session_state["project_groups_map"] = {
-      k: list(v) for k, v in inferred_groups.items()
-  }
-if "selected_projects" not in st.session_state:
-  st.session_state["selected_projects"] = list(group_order)
-if "project_specs_map" not in st.session_state:
-  st.session_state["project_specs_map"] = {}
-
-proj_map = st.session_state["project_groups_map"]
+proj_map = st.session_state.setdefault(
+    "project_groups_map", {k: list(v) for k, v in inferred_groups.items()}
+)
 available_proj_names = list(proj_map.keys())
 
-valid_default_projs = [
-    p for p in st.session_state["selected_projects"] if p in available_proj_names
+draft_default = [
+    p
+    for p in st.session_state.get("draft_projects", suggested_default_groups)
+    if p in available_proj_names
 ]
-if not valid_default_projs and available_proj_names:
-  valid_default_projs = available_proj_names
 
 selected_projects = st.sidebar.multiselect(
-    "同时生成的项目 / 参数组（可多选）",
+    "待生成项目 / 参数组（已自动排除日期/编号等列）",
     options=available_proj_names,
-    default=valid_default_projs,
-    help="例如同时选中「涂宽」、「白边」、「错位」，将在同一页面批量生成全部图像并支持一键打包下载 ZIP。",
+    default=draft_default,
+    help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新图表」，避免非检测列拖慢操作。",
 )
-st.session_state["selected_projects"] = selected_projects
+st.session_state["draft_projects"] = selected_projects
 
 with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=False):
   for p_name in available_proj_names:
@@ -312,13 +339,33 @@ with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=Fals
     if new_grp_name.strip() and new_grp_cols:
       g_clean = new_grp_name.strip()
       proj_map[g_clean] = list(new_grp_cols)
-      if g_clean not in st.session_state["selected_projects"]:
-        st.session_state["selected_projects"].append(g_clean)
+      if g_clean not in st.session_state["draft_projects"]:
+        st.session_state["draft_projects"].append(g_clean)
       st.rerun()
 
-active_projects = [p for p in selected_projects if len(proj_map.get(p, [])) > 0]
-if not active_projects:
-  st.warning("👈 请在左侧至少选择一个包含有效通道列的项目。")
+# 显式“生成 / 更新图表”按钮
+generate_clicked = st.sidebar.button(
+    "🚀 生成 / 更新所选项目图表",
+    type="primary",
+    use_container_width=True,
+)
+if generate_clicked:
+  st.session_state["confirmed_projects"] = [
+      p for p in selected_projects if len(proj_map.get(p, [])) > 0
+  ]
+  st.session_state["charts_generated"] = True
+
+confirmed_projects = [
+    p
+    for p in st.session_state.get("confirmed_projects", [])
+    if p in available_proj_names and len(proj_map.get(p, [])) > 0
+]
+
+if not st.session_state.get("charts_generated", False) or not confirmed_projects:
+  st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+  st.info(
+      "👈 请先在左侧确认**待生成项目**及**各项目通道列**（已自动过滤日期、编号、走带等非检测列），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+  )
   st.stop()
 
 
@@ -349,8 +396,8 @@ def compute_recommended_spec(df_src, cols_sel, s_info):
   return float(rec_lsl), float(rec_target), float(rec_usl)
 
 
-specs_map = st.session_state["project_specs_map"]
-for p_name in active_projects:
+specs_map = st.session_state.setdefault("project_specs_map", {})
+for p_name in confirmed_projects:
   p_key = f"{dataset_key}::{p_name}"
   if p_key not in specs_map:
     rl, rt, ru = compute_recommended_spec(df_raw, proj_map[p_name], spec_info)
@@ -360,7 +407,7 @@ for p_name in active_projects:
 st.sidebar.header("2️⃣ 各项目 SPEC 规格")
 current_focus_proj = st.sidebar.selectbox(
     "当前编辑 SPEC 的项目",
-    options=active_projects,
+    options=confirmed_projects,
     index=0,
     key="focus_spec_proj",
 )
@@ -406,9 +453,9 @@ if st.sidebar.button(
   specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
   st.rerun()
 
-if len(active_projects) > 1:
-  with st.sidebar.expander("📋 批量查看/修改全部选中项目 SPEC", expanded=False):
-    for p_name in active_projects:
+if len(confirmed_projects) > 1:
+  with st.sidebar.expander("📋 批量查看/修改全部已生成项目 SPEC", expanded=False):
+    for p_name in confirmed_projects:
       pk = f"{dataset_key}::{p_name}"
       st.caption(f"**{p_name}**")
       b1, b2, b3 = st.columns(3)
@@ -569,7 +616,7 @@ st.sidebar.markdown("---")
 with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
   sigma_target_proj = st.selectbox(
       "校准作用项目",
-      options=["当前聚焦项目"] + active_projects,
+      options=["当前聚焦项目"] + confirmed_projects,
       index=0,
   )
   enable_sigma_tuning = st.checkbox(
@@ -772,7 +819,7 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
 
 
 project_bundles = {}
-for p_name in active_projects:
+for p_name in confirmed_projects:
   pk = f"{dataset_key}::{p_name}"
   sp = specs_map[pk]
   b_data = build_project_dataset(
@@ -806,14 +853,10 @@ def ensure_project_title_keys(p_name):
   k_box = f"t_box_{dataset_key}_{p_name}"
   k_ts = f"t_ts_{dataset_key}_{p_name}"
   k_mean = f"t_mean_{dataset_key}_{p_name}"
-  if k_cap not in st.session_state:
-    st.session_state[k_cap] = d_cap
-  if k_box not in st.session_state:
-    st.session_state[k_box] = d_box
-  if k_ts not in st.session_state:
-    st.session_state[k_ts] = d_ts
-  if k_mean not in st.session_state:
-    st.session_state[k_mean] = d_mean
+  st.session_state.setdefault(k_cap, d_cap)
+  st.session_state.setdefault(k_box, d_box)
+  st.session_state.setdefault(k_ts, d_ts)
+  st.session_state.setdefault(k_mean, d_mean)
   return k_cap, k_box, k_ts, k_mean
 
 
@@ -1534,6 +1577,84 @@ def render_excel_style_row_mean_plot(
 
   plt.tight_layout(pad=1.0)
   return save_fig_with_border(fig, use_tight=True)
+
+
+# ==================== 顶部栏：标题、浅灰外边框开关与多项目一键 ZIP 打包 ====================
+st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+
+
+def default_titles_for_project(p_name):
+  return (
+      f"{p_name} — Process Capability Report",
+      f"{p_name} — Box Plot",
+      f"{p_name} — Time Series Plot",
+      f"{p_name}均值",
+  )
+
+
+def ensure_project_title_keys(p_name):
+  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
+  k_cap = f"t_cap_{dataset_key}_{p_name}"
+  k_box = f"t_box_{dataset_key}_{p_name}"
+  k_ts = f"t_ts_{dataset_key}_{p_name}"
+  k_mean = f"t_mean_{dataset_key}_{p_name}"
+  st.session_state.setdefault(k_cap, d_cap)
+  st.session_state.setdefault(k_box, d_box)
+  st.session_state.setdefault(k_ts, d_ts)
+  st.session_state.setdefault(k_mean, d_mean)
+  return k_cap, k_box, k_ts, k_mean
+
+
+top_bar1, top_bar2 = st.columns([3.5, 1.2])
+with top_bar1:
+  with st.expander(
+      "✏️ 自定义各项目图表主标题（默认保留标准后缀，特殊情况可直接删改）",
+      expanded=False,
+  ):
+    title_target_proj = st.selectbox(
+        "选择要自定义标题的项目", options=ready_projects, key="title_proj_sel"
+    )
+    k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(title_target_proj)
+    t_c1, t_c2 = st.columns(2)
+    t_c1.text_input("能力报告标题", key=k_cap)
+    t_c2.text_input("箱线图标题", key=k_box)
+    t_c3, t_c4 = st.columns(2)
+    t_c3.text_input("时间序列图标题", key=k_ts)
+    t_c4.text_input("单行均值图标题", key=k_mean)
+
+    if st.button(
+        f"↩️ 恢复 [{title_target_proj}] 默认标准后缀标题",
+        key=f"reset_titles_{dataset_key}_{title_target_proj}",
+    ):
+      d_cap, d_box, d_ts, d_mean = default_titles_for_project(title_target_proj)
+      st.session_state[k_cap] = d_cap
+      st.session_state[k_box] = d_box
+      st.session_state[k_ts] = d_ts
+      st.session_state[k_mean] = d_mean
+      st.rerun()
+
+with top_bar2:
+  show_outer_border = st.checkbox(
+      "🖼️ 图像浅灰外边框",
+      value=True,
+      help="为导出图片添加浅灰色矩形边框，方便粘贴至 PPT 多图排版对齐",
+  )
+
+
+def get_project_titles(p_name):
+  """严格按输入框当前值生成标题；若用户主动留空，则回退该项目的默认标准后缀"""
+  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
+  k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(p_name)
+  v_cap = str(st.session_state.get(k_cap, "")).strip()
+  v_box = str(st.session_state.get(k_box, "")).strip()
+  v_ts = str(st.session_state.get(k_ts, "")).strip()
+  v_mean = str(st.session_state.get(k_mean, "")).strip()
+  return (
+      v_cap if v_cap else d_cap,
+      v_box if v_box else d_box,
+      v_ts if v_ts else d_ts,
+      v_mean if v_mean else d_mean,
+  )
 
 
 # ==================== 多项目汇总表与一键打包 ZIP ====================
