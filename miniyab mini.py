@@ -201,14 +201,13 @@ if not selected_value_cols:
   st.warning("👈 请在左侧至少选择一列检测数值列。")
   st.stop()
 
-# ==================== 2. SPEC 规格设定（自动匹配 + 换列重算 + 一键重置） ====================
+# ==================== 2. SPEC 规格设定 ====================
 st.sidebar.header("2️⃣ SPEC 规格设定")
 dataset_key = f"{uploaded_file.name}::{selected_sheet}"
 cols_signature = tuple(selected_value_cols)
 
 
 def compute_recommended_spec(df_src, cols_sel, s_info):
-  """优先返回表格识别到的 SPEC；若无则基于当前选定列的数据均值与标准差自动估算"""
   vals = df_src[list(cols_sel)].to_numpy(dtype=float)
   valid_v = vals[~np.isnan(vals)]
   if len(valid_v) > 0:
@@ -218,8 +217,12 @@ def compute_recommended_spec(df_src, cols_sel, s_info):
   else:
     mid, half_tol = 0.0, 1.0
 
-  rec_lsl = s_info["lsl"] if s_info["lsl"] is not None else round(mid - half_tol, 4)
-  rec_usl = s_info["usl"] if s_info["usl"] is not None else round(mid + half_tol, 4)
+  rec_lsl = (
+      s_info["lsl"] if s_info["lsl"] is not None else round(mid - half_tol, 4)
+  )
+  rec_usl = (
+      s_info["usl"] if s_info["usl"] is not None else round(mid + half_tol, 4)
+  )
   if s_info["target"] is not None:
     rec_target = s_info["target"]
   elif s_info["lsl"] is not None and s_info["usl"] is not None:
@@ -232,15 +235,10 @@ def compute_recommended_spec(df_src, cols_sel, s_info):
 rec_lsl, rec_target, rec_usl = compute_recommended_spec(
     df_raw, selected_value_cols, spec_info
 )
-
 has_table_spec = any(
     spec_info[k] is not None for k in ("lsl", "target", "usl")
 )
 
-# 判断是否需要初始化或自动重新获取上下限：
-# 1) 切换了文件/Sheet
-# 2) 因为清空 multiselect 导致 Streamlit 清理了输入框状态（或归零成 0==0）
-# 3) 表格无自带 SPEC 且用户重新选择了分析列（未手动锁定）
 need_auto_fill = False
 if st.session_state.get("active_dataset_key") != dataset_key:
   st.session_state["active_dataset_key"] = dataset_key
@@ -290,7 +288,6 @@ usl = col_spec3.number_input(
     "USL", key="spec_usl_input", format="%.4f", on_change=on_spec_manual_change
 )
 
-# 始终保留一键重新获取/重置上下限按钮
 btn_label = (
     "🔄 重新获取表格 SPEC 上下限"
     if has_table_spec
@@ -394,7 +391,6 @@ if len(raw_all_valid_vals) < 2:
 
 
 def compute_within_std(mat, flat_vals):
-  """按 Minitab 子组跨数行计算组内标准差 (Within StDev)"""
   s_ov = float(np.std(flat_vals, ddof=1))
   if mat.shape[1] >= 2:
     r_counts = np.sum(~np.isnan(mat), axis=1)
@@ -510,7 +506,7 @@ exp_wi_gt_usl = (
 )
 exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
 
-# ==================== 右侧主工作区：顶部概览与紧凑标题栏 ====================
+# ==================== 右侧主工作区：顶部概览与紧凑控制条 ====================
 st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
 
 m1, m2, m3, m4 = st.columns(4)
@@ -519,34 +515,66 @@ m2.metric("有效分析行数", len(df_clean))
 m3.metric("已全局屏蔽行数", len(df_removed))
 m4.metric("总样本数 N", len(all_valid_vals))
 
-with st.expander("✏️ 自定义项目名称与各图表主标题（点击展开）", expanded=False):
-  t_col0, t_col1, t_col2 = st.columns(3)
-  base_topic_name = t_col0.text_input(
-      "项目 / 检测参数名称（自动同步至各图）",
-      value=selected_sheet,
-      placeholder="例如: 单面面密度",
-  )
-  custom_title_cap = t_col1.text_input(
-      "过程能力报告标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name} — Process Capability Report",
-  )
-  custom_title_box = t_col2.text_input(
-      "分组箱线图标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name} — Box Plot",
-  )
-  t_col3, t_col4 = st.columns(2)
-  custom_title_ts = t_col3.text_input(
-      "多通道时间序列图标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name} — Time Series Plot",
-  )
-  custom_title_mean = t_col4.text_input(
-      "单行均值趋势图标题（留空自动生成）",
-      value="",
-      placeholder=f"{base_topic_name}均值",
-  )
+ctrl_col1, ctrl_col2 = st.columns(2)
+
+with ctrl_col1:
+  with st.expander("📐 图像比例与尺寸（适配 PPT 多图排版）", expanded=True):
+    aspect_preset = st.selectbox(
+        "选择图像宽高比预设",
+        options=[
+            "4 : 3（PPT 四宫格/并排标准推荐）",
+            "3 : 2（紧凑双图对比）",
+            "16 : 9（单图宽屏展示）",
+            "2.2 : 1（超宽横幅）",
+            "自定义宽高比",
+        ],
+        index=0,
+    )
+    if aspect_preset == "4 : 3（PPT 四宫格/并排标准推荐）":
+      fig_w, fig_h = 9.6, 7.2
+    elif aspect_preset == "3 : 2（紧凑双图对比）":
+      fig_w, fig_h = 10.5, 7.0
+    elif aspect_preset == "16 : 9（单图宽屏展示）":
+      fig_w, fig_h = 12.8, 7.2
+    elif aspect_preset == "2.2 : 1（超宽横幅）":
+      fig_w, fig_h = 13.6, 6.2
+    else:
+      ac1, ac2 = st.columns(2)
+      ratio_w = ac1.number_input("宽度比例", min_value=1.0, max_value=30.0, value=4.0, step=0.5)
+      ratio_h = ac2.number_input("高度比例", min_value=1.0, max_value=30.0, value=3.0, step=0.5)
+      base_h = 7.0
+      fig_w = float(np.clip(base_h * (ratio_w / ratio_h), 6.5, 16.0))
+      fig_h = base_h
+
+with ctrl_col2:
+  with st.expander("✏️ 自定义项目名称与各图表主标题", expanded=False):
+    base_topic_name = st.text_input(
+        "项目 / 检测参数名称（自动同步至各图）",
+        value=selected_sheet,
+        placeholder="例如: Coating density of single side",
+    )
+    tc_a, tc_b = st.columns(2)
+    custom_title_cap = tc_a.text_input(
+        "能力报告标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name} — Process Capability Report",
+    )
+    custom_title_box = tc_b.text_input(
+        "箱线图标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name} — Box Plot",
+    )
+    tc_c, tc_d = st.columns(2)
+    custom_title_ts = tc_c.text_input(
+        "时间序列图标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name} — Time Series Plot",
+    )
+    custom_title_mean = tc_d.text_input(
+        "单行均值图标题（留空自动生成）",
+        value="",
+        placeholder=f"{base_topic_name}均值",
+    )
 
 topic_clean = (
     base_topic_name.strip() if base_topic_name.strip() else selected_sheet
@@ -573,56 +601,77 @@ final_title_mean = (
 )
 
 
-# ==================== 图表渲染函数 ====================
-def render_capability_plot():
-  fig = plt.figure(figsize=(14, 6.2), dpi=160)
+# ==================== 图表渲染函数（自适应画布比例） ====================
+def render_capability_plot(w_in, h_in):
+  """紧凑型 Minitab 风格过程能力报告：左右信息紧贴直方图，PPM 性能表位于直方图正下方，完美兼容 4:3 等任意 PPT 比例"""
+  fig = plt.figure(figsize=(w_in, h_in), dpi=170)
   fig.patch.set_facecolor("white")
-  gs = fig.add_gridspec(1, 3, width_ratios=[1.2, 2.5, 1.1], wspace=0.14)
 
-  ax_left = fig.add_subplot(gs[0])
-  ax_mid = fig.add_subplot(gs[1])
-  ax_right = fig.add_subplot(gs[2])
-  ax_left.axis("off")
-  ax_right.axis("off")
+  # 根据画布宽度自适应微调字号与比例
+  scale_f = min(w_in / 9.6, h_in / 7.2)
+  font_panel = max(7.2, 8.3 * scale_f)
+  font_title = max(11.5, 13.5 * scale_f)
 
-  bins_count = min(40, max(15, int(np.sqrt(total_n) * 0.6)))
+  # 2行3列网格：上行 [左过程数据 | 中直方图 | 右能力指数]，下行 [空 | 底部PPM性能表 | 右图例]
+  gs = fig.add_gridspec(
+      2,
+      3,
+      width_ratios=[1.05, 2.35, 0.95],
+      height_ratios=[3.6, 1.15],
+      wspace=0.06,
+      hspace=0.22,
+  )
+
+  ax_left = fig.add_subplot(gs[0, 0])
+  ax_mid = fig.add_subplot(gs[0, 1])
+  ax_right = fig.add_subplot(gs[0, 2])
+  ax_bot_left = fig.add_subplot(gs[1, 0])
+  ax_bot_mid = fig.add_subplot(gs[1, 1])
+  ax_bot_right = fig.add_subplot(gs[1, 2])
+
+  for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
+    ax_tmp.axis("off")
+
+  # --- 中间直方图与正态拟合曲线 ---
+  bins_count = min(38, max(14, int(np.sqrt(total_n) * 0.55)))
   counts, _, _ = ax_mid.hist(
       all_valid_vals,
       bins=bins_count,
       density=True,
       color="#78A2CC",
       edgecolor="#3A5F85",
-      linewidth=0.6,
-      alpha=0.9,
+      linewidth=0.55,
+      alpha=0.92,
   )
 
   span = usl - lsl
-  x_min_c = min(lsl - 0.25 * span, float(np.min(all_valid_vals)) - 0.1 * span)
-  x_max_c = max(usl + 0.25 * span, float(np.max(all_valid_vals)) + 0.1 * span)
+  x_min_c = min(lsl - 0.18 * span, float(np.min(all_valid_vals)) - 0.08 * span)
+  x_max_c = max(usl + 0.18 * span, float(np.max(all_valid_vals)) + 0.08 * span)
   x_grid = np.linspace(x_min_c, x_max_c, 500)
 
+  line_ov, line_wi = None, None
   if std_overall > 0:
-    ax_mid.plot(
+    (line_ov,) = ax_mid.plot(
         x_grid,
         stats.norm.pdf(x_grid, sample_mean, std_overall),
         color="#B91C1C",
-        lw=1.9,
+        lw=1.8,
         ls="-",
         label="Overall",
     )
   if std_within > 0:
-    ax_mid.plot(
+    (line_wi,) = ax_mid.plot(
         x_grid,
         stats.norm.pdf(x_grid, sample_mean, std_within),
         color="#374151",
-        lw=1.7,
+        lw=1.6,
         ls="--",
         label="Within",
     )
 
-  ax_mid.axvline(lsl, color="#DC2626", ls="--", lw=1.3)
-  ax_mid.axvline(usl, color="#DC2626", ls="--", lw=1.3)
-  ax_mid.axvline(target, color="#16A34A", ls=":", lw=1.2)
+  ax_mid.axvline(lsl, color="#DC2626", ls="--", lw=1.15)
+  ax_mid.axvline(usl, color="#DC2626", ls="--", lw=1.15)
+  ax_mid.axvline(target, color="#16A34A", ls=":", lw=1.1)
 
   y_peak = max(
       float(np.max(counts)) if len(counts) else 1.0,
@@ -630,124 +679,160 @@ def render_capability_plot():
       if std_within > 0
       else 1.0,
   )
-  ax_mid.set_ylim(0, y_peak * 1.18)
+  ax_mid.set_ylim(0, y_peak * 1.14)
   ax_mid.set_yticks([])
+  ax_mid.tick_params(axis="x", labelsize=max(7.5, 8.8 * scale_f))
   ax_mid.grid(True, axis="x", ls=":", alpha=0.45)
+  for sp in ("top", "right", "left", "bottom"):
+    ax_mid.spines[sp].set_color("#CBD5E1")
+    ax_mid.spines[sp].set_linewidth(0.8)
 
+  # 顶部规格线标签（紧凑贴合顶框）
+  lbl_sz = max(7.5, 8.5 * scale_f)
   ax_mid.text(
       lsl,
-      y_peak * 1.20,
+      y_peak * 1.16,
       f"LSL\n{lsl:.2f}",
       color="#B91C1C",
       ha="center",
       va="bottom",
-      fontsize=9,
+      fontsize=lbl_sz,
       fontweight="bold",
   )
   ax_mid.text(
       usl,
-      y_peak * 1.20,
+      y_peak * 1.16,
       f"USL\n{usl:.2f}",
       color="#B91C1C",
       ha="center",
       va="bottom",
-      fontsize=9,
+      fontsize=lbl_sz,
       fontweight="bold",
   )
   ax_mid.text(
       target,
-      y_peak * 1.20,
+      y_peak * 1.16,
       f"Target\n{target:.2f}",
       color="#15803D",
       ha="center",
       va="bottom",
-      fontsize=9,
+      fontsize=lbl_sz,
   )
-  ax_mid.legend(loc="upper right", fontsize=9, frameon=True)
 
+  # --- 左侧：过程数据（紧贴直方图左侧，无冗余大框） ---
   left_text = (
       f"Process Data\n"
-      f"------------------------\n"
-      f"LSL            {lsl:.4f}\n"
-      f"Target         {target:.4f}\n"
-      f"USL            {usl:.4f}\n"
-      f"Sample Mean    {sample_mean:.4f}\n"
-      f"Sample N       {total_n}\n"
-      f"Valid Rows     {len(df_clean)}\n"
-      f"Subgroup Size  {k_cols}\n"
-      f"StDev(Overall) {std_overall:.6f}\n"
-      f"StDev(Within)  {std_within:.6f}\n\n"
-      f"Performance (PPM)\n"
-      f"           Obs    Exp.Ov   Exp.Wi\n"
-      f"< LSL   {obs_lt_lsl:7.2f}  {exp_ov_lt_lsl:7.2f}  {exp_wi_lt_lsl:7.2f}\n"
-      f"> USL   {obs_gt_usl:7.2f}  {exp_ov_gt_usl:7.2f}  {exp_wi_gt_usl:7.2f}\n"
-      f"Total   {obs_total:7.2f}  {exp_ov_total:7.2f}  {exp_wi_total:7.2f}"
+      f"----------------------\n"
+      f"LSL          {lsl:.4f}\n"
+      f"Target       {target:.4f}\n"
+      f"USL          {usl:.4f}\n"
+      f"Mean         {sample_mean:.4f}\n"
+      f"Sample N     {total_n}\n"
+      f"Valid Rows   {len(df_clean)}\n"
+      f"Subgroup     {k_cols}\n"
+      f"StDev(Ov)    {std_overall:.5f}\n"
+      f"StDev(Wi)    {std_within:.5f}"
   )
   ax_left.text(
-      0.0,
-      0.5,
+      0.95,
+      0.96,
       left_text,
       transform=ax_left.transAxes,
-      va="center",
-      ha="left",
-      fontsize=8.4,
+      va="top",
+      ha="right",
+      fontsize=font_panel,
       fontfamily="monospace",
-      bbox=dict(
-          boxstyle="round,pad=0.55", facecolor="#F8FAFC", edgecolor="#CBD5E1"
-      ),
+      color="#1E293B",
   )
 
+  # --- 右侧：整体能力 & 潜在能力（紧贴直方图右侧） ---
   right_text = (
       f"Overall Capability\n"
-      f"--------------------\n"
-      f"Pp          {pp:.2f}\n"
-      f"PPL         {ppl:.2f}\n"
-      f"PPU         {ppu:.2f}\n"
-      f"Ppk         {ppk:.2f}\n\n"
+      f"------------------\n"
+      f"Pp        {pp:.2f}\n"
+      f"PPL       {ppl:.2f}\n"
+      f"PPU       {ppu:.2f}\n"
+      f"Ppk       {ppk:.2f}\n\n"
       f"Potential (Within)\n"
-      f"--------------------\n"
-      f"Cp          {cp:.2f}\n"
-      f"CPL         {cpl:.2f}\n"
-      f"CPU         {cpu:.2f}\n"
-      f"Cpk         {cpk:.2f}"
+      f"------------------\n"
+      f"Cp        {cp:.2f}\n"
+      f"CPL       {cpl:.2f}\n"
+      f"CPU       {cpu:.2f}\n"
+      f"Cpk       {cpk:.2f}"
   )
   ax_right.text(
-      0.02,
-      0.5,
+      0.06,
+      0.96,
       right_text,
       transform=ax_right.transAxes,
-      va="center",
+      va="top",
       ha="left",
-      fontsize=9,
+      fontsize=font_panel,
       fontfamily="monospace",
+      color="#1E293B",
+  )
+
+  # --- 右下角：Overall / Within 曲线图例（不遮挡直方图内部） ---
+  handles_leg = [h for h in (line_ov, line_wi) if h is not None]
+  if handles_leg:
+    ax_bot_right.legend(
+        handles=handles_leg,
+        loc="upper left",
+        bbox_to_anchor=(0.04, 0.98),
+        fontsize=font_panel,
+        frameon=True,
+        facecolor="#F8FAFC",
+        edgecolor="#CBD5E1",
+    )
+
+  # --- 底部正中：Performance (PPM) 表（对齐直方图正下方，复刻 Minitab 原版） ---
+  ppm_text = (
+      f"Performance (PPM)        Observed    Exp. Overall    Exp. Within\n"
+      f"----------------------------------------------------------------\n"
+      f"PPM < LSL               {obs_lt_lsl:9.2f}       {exp_ov_lt_lsl:9.2f}      {exp_wi_lt_lsl:9.2f}\n"
+      f"PPM > USL               {obs_gt_usl:9.2f}       {exp_ov_gt_usl:9.2f}      {exp_wi_gt_usl:9.2f}\n"
+      f"Total PPM               {obs_total:9.2f}       {exp_ov_total:9.2f}      {exp_wi_total:9.2f}"
+  )
+  ax_bot_mid.text(
+      0.5,
+      0.92,
+      ppm_text,
+      transform=ax_bot_mid.transAxes,
+      va="top",
+      ha="center",
+      fontsize=max(7.0, font_panel * 0.96),
+      fontfamily="monospace",
+      color="#1E293B",
       bbox=dict(
-          boxstyle="round,pad=0.6", facecolor="#F8FAFC", edgecolor="#CBD5E1"
+          boxstyle="round,pad=0.4", facecolor="#F8FAFC", edgecolor="#E2E8F0"
       ),
   )
 
   fig.suptitle(
       final_title_cap,
-      fontsize=14,
+      fontsize=font_title,
       fontweight="bold",
-      y=0.97,
+      y=0.965,
       fontproperties=FONT_PROP,
   )
-  plt.subplots_adjust(left=0.03, right=0.97, top=0.83, bottom=0.08)
+  plt.subplots_adjust(left=0.02, right=0.98, top=0.84, bottom=0.04)
 
   buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=160)
+  fig.savefig(buf, format="png", dpi=170)
   buf.seek(0)
   plt.close(fig)
   return buf
 
 
 def render_box_plot(
+    w_in,
+    h_in,
     show_outliers=False,
     show_median_val=True,
     show_mean_val=False,
     decimals=4,
 ):
-  fig, ax = plt.subplots(figsize=(14.5, 5.8), dpi=160)
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
   fig.patch.set_facecolor("white")
 
   box_data = [
@@ -779,18 +864,23 @@ def render_box_plot(
   ax.axhline(target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
   ax.axhline(lsl, color="#DC2626", ls="--", lw=1.2)
 
-  label_font_size = 8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0)
+  width_scale = min(w_in / 11.0, 1.15)
+  label_font_size = (
+      (8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0)) * width_scale
+  )
   x_offset = box_width * 0.54
   fmt_str = f"{{:.{decimals}f}}"
 
   if show_mean_val:
-    means_arr = [float(np.mean(arr)) if len(arr) > 0 else np.nan for arr in box_data]
+    means_arr = [
+        float(np.mean(arr)) if len(arr) > 0 else np.nan for arr in box_data
+    ]
     ax.scatter(
         np.arange(1, n_boxes + 1),
         means_arr,
         color="#1D4ED8",
         edgecolor="white",
-        s=24,
+        s=22,
         zorder=5,
         label="Mean",
     )
@@ -857,7 +947,7 @@ def render_box_plot(
       )
 
   if show_median_val or show_mean_val:
-    ax.set_xlim(0.4, n_boxes + 0.95)
+    ax.set_xlim(0.4, n_boxes + 1.05)
 
   ax_r = ax.twinx()
   ax_r.set_ylim(ax.get_ylim())
@@ -865,20 +955,20 @@ def render_box_plot(
   ax_r.set_yticklabels(
       [f"{lsl}", f"{target}", f"{usl}"],
       color="#B91C1C",
-      fontsize=9,
+      fontsize=8.8,
       fontweight="bold",
   )
 
   ax.set_title(
       final_title_box,
-      fontsize=14,
+      fontsize=max(11.5, 13.5 * width_scale),
       fontweight="bold",
       pad=12,
       fontproperties=FONT_PROP,
   )
-  ax.set_ylabel("Value", fontsize=10.5)
+  ax.set_ylabel("Value", fontsize=10)
   ax.tick_params(
-      axis="x", rotation=45 if len(box_labels) > 6 else 0, labelsize=9
+      axis="x", rotation=45 if len(box_labels) > 5 else 0, labelsize=8.8
   )
   for lbl in ax.get_xticklabels():
     lbl.set_fontproperties(FONT_PROP)
@@ -886,14 +976,16 @@ def render_box_plot(
   plt.tight_layout()
 
   buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=160)
+  fig.savefig(buf, format="png", dpi=170)
   buf.seek(0)
   plt.close(fig)
   return buf
 
 
-def render_time_series_plot(x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None):
-  fig, ax = plt.subplots(figsize=(14, 5.8), dpi=160)
+def render_time_series_plot(
+    w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
+):
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
   fig.patch.set_facecolor("white")
 
   if x_mode_opt == "保留原始表格行号 (Row Index)":
@@ -915,7 +1007,7 @@ def render_time_series_plot(x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
         color=cmap(idx % 20),
         lw=1.1,
         marker=markers[idx % len(markers)],
-        markersize=3.4,
+        markersize=3.2,
         markevery=step_mark,
         alpha=0.85,
         label=str(col_name),
@@ -933,54 +1025,58 @@ def render_time_series_plot(x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
   ):
     ax.set_ylim(ymin_val, ymax_val)
 
+  width_scale = min(w_in / 11.0, 1.15)
   ax.set_title(
       final_title_ts,
-      fontsize=14,
+      fontsize=max(11.5, 13.5 * width_scale),
       fontweight="bold",
       pad=12,
       fontproperties=FONT_PROP,
   )
-  ax.set_xlabel(x_label_text, fontsize=10.5)
-  ax.set_ylabel("Value", fontsize=10.5)
+  ax.set_xlabel(x_label_text, fontsize=10)
+  ax.set_ylabel("Value", fontsize=10)
   ax.grid(True, ls=":", alpha=0.45)
 
   handles, labels_ts = ax.get_legend_handles_labels()
-  if len(handles) <= 20:
+  # 偏窄比例时（如 4:3）图例自动放到底部多列排布，避免挤压主图宽度
+  if w_in / h_in < 1.55:
+    n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
     leg = ax.legend(
-        handles,
-        labels_ts,
-        title="Variables",
-        bbox_to_anchor=(1.02, 1),
-        loc="upper left",
+        handles[:20],
+        labels_ts[:20],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.15),
+        ncol=n_cols_leg,
         prop=FONT_PROP,
-        fontsize=8.2,
+        fontsize=7.6,
+        frameon=True,
     )
   else:
     leg = ax.legend(
         handles[:20],
         labels_ts[:20],
-        title="Variables (Top 20)",
+        title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
         prop=FONT_PROP,
         fontsize=8.0,
     )
-  leg.get_title().set_fontsize(9)
+    leg.get_title().set_fontsize(8.8)
 
   plt.tight_layout()
 
   buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+  fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
   buf.seek(0)
   plt.close(fig)
   return buf
 
 
 def render_excel_style_row_mean_plot(
-    x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
+    w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
 ):
   """复刻经典 Excel 折线图风格的单行均值趋势图"""
-  fig, ax = plt.subplots(figsize=(13.5, 5.6), dpi=160)
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
   fig.patch.set_facecolor("white")
   ax.set_facecolor("white")
 
@@ -995,28 +1091,28 @@ def render_excel_style_row_mean_plot(
       x_seq,
       np.full_like(x_seq, target, dtype=float),
       color="#4472C4",
-      lw=2.6,
+      lw=2.5,
       label="目标值",
   )
   ax.plot(
       x_seq,
       np.full_like(x_seq, usl, dtype=float),
       color="#ED7D31",
-      lw=2.6,
+      lw=2.5,
       label="规格上限",
   )
   ax.plot(
       x_seq,
       np.full_like(x_seq, lsl, dtype=float),
       color="#A5A5A5",
-      lw=2.6,
+      lw=2.5,
       label="规格下限",
   )
   ax.plot(
       x_seq,
       y_mean_series,
       color="#FFC000",
-      lw=2.3,
+      lw=2.2,
       label="平均值",
   )
 
@@ -1040,17 +1136,18 @@ def render_excel_style_row_mean_plot(
   ax.set_xlim(x_seq[0], x_seq[-1])
 
   if len(x_seq) > 1:
-    tick_step = max(1, len(x_seq) // 27)
+    n_ticks = max(12, int(w_in * 2.1))
+    tick_step = max(1, len(x_seq) // n_ticks)
     tick_positions = x_seq[::tick_step]
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(
         [str(v) for v in tick_positions],
         rotation=90,
-        fontsize=9.5,
+        fontsize=9.0,
         color="#595959",
     )
 
-  ax.tick_params(axis="y", labelsize=10, colors="#595959", length=0)
+  ax.tick_params(axis="y", labelsize=9.5, colors="#595959", length=0)
   ax.tick_params(axis="x", length=0, pad=5)
 
   ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color="#D9D9D9")
@@ -1061,12 +1158,13 @@ def render_excel_style_row_mean_plot(
   ax.spines["bottom"].set_color("#D9D9D9")
   ax.spines["bottom"].set_linewidth(0.9)
 
+  width_scale = min(w_in / 10.5, 1.15)
   ax.set_title(
       final_title_mean,
-      fontsize=17,
+      fontsize=max(13.5, 16.5 * width_scale),
       fontweight="normal",
       color="#595959",
-      pad=18,
+      pad=16,
       fontproperties=FONT_PROP,
   )
 
@@ -1076,9 +1174,9 @@ def render_excel_style_row_mean_plot(
       ncol=4,
       frameon=False,
       prop=FONT_PROP,
-      fontsize=11,
-      handlelength=2.4,
-      columnspacing=2.2,
+      fontsize=10.5,
+      handlelength=2.2,
+      columnspacing=1.8,
   )
   for text in leg.get_texts():
     text.set_color("#595959")
@@ -1086,13 +1184,13 @@ def render_excel_style_row_mean_plot(
   plt.tight_layout()
 
   buf = io.BytesIO()
-  fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+  fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
   buf.seek(0)
   plt.close(fig)
   return buf
 
 
-# ==================== 独立分标签页（各图设置内嵌于对应页面上方） ====================
+# ==================== 独立分标签页（按真实比例预览与导出） ====================
 tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
     "1️⃣ 过程能力报告 (CPK)",
     "2️⃣ 分组箱线图 (Box Plot)",
@@ -1102,10 +1200,11 @@ tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
 ])
 
 safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", topic_clean)
+preview_px_width = int(min(1050, max(620, fig_w * 85)))
 
 with tab_cap:
-  buf_cap = render_capability_plot()
-  st.image(buf_cap, width="stretch")
+  buf_cap = render_capability_plot(fig_w, fig_h)
+  st.image(buf_cap, width=preview_px_width)
   buf_cap.seek(0)
   st.download_button(
       "🖼️ 下载当前过程能力报告图 (.png)",
@@ -1124,12 +1223,14 @@ with tab_box:
   )
 
   buf_box = render_box_plot(
+      fig_w,
+      fig_h,
       show_outliers=show_box_outliers,
       show_median_val=show_box_median,
       show_mean_val=show_box_mean,
       decimals=box_decimals,
   )
-  st.image(buf_box, width="stretch")
+  st.image(buf_box, width=preview_px_width)
   buf_box.seek(0)
   st.download_button(
       "🖼️ 下载当前箱线图 (.png)",
@@ -1165,8 +1266,10 @@ with tab_ts:
         "Y-Max", value=round(default_ymax + pad, 4), format="%.4f", key="ts_ymax"
     )
 
-  buf_ts = render_time_series_plot(ts_x_mode, ts_y_mode, ts_ymin, ts_ymax)
-  st.image(buf_ts, width="stretch")
+  buf_ts = render_time_series_plot(
+      fig_w, fig_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
+  )
+  st.image(buf_ts, width=preview_px_width)
   buf_ts.seek(0)
   st.download_button(
       "🖼️ 下载当前多通道时间序列图 (.png)",
@@ -1206,9 +1309,9 @@ with tab_mean:
     )
 
   buf_mean = render_excel_style_row_mean_plot(
-      mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
+      fig_w, fig_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
   )
-  st.image(buf_mean, width="stretch")
+  st.image(buf_mean, width=preview_px_width)
   buf_mean.seek(0)
   st.download_button(
       "🖼️ 下载当前单行均值趋势图 (.png)",
