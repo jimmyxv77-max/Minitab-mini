@@ -78,7 +78,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
 st.caption(
-    "严格对齐 Minitab「子组跨数行」CPK 算法｜支持 SPEC 表头自动识别与手动微调｜全局屏蔽引擎同步驱动全套三图"
+    "严格对齐 Minitab「子组跨数行」CPK 算法｜支持 SPEC 表头自动识别｜全局屏蔽引擎同步驱动全套四图"
 )
 
 # ==================== 1. 文件上传与 Sheet 选择 ====================
@@ -278,13 +278,13 @@ if lsl >= usl:
   st.stop()
 
 # ==================== 4. 全局统一数据屏蔽引擎 ====================
-st.sidebar.header("4️⃣ 全局样本屏蔽（同步作用于全套三图）")
+st.sidebar.header("4️⃣ 全局样本屏蔽（同步作用于全套四图）")
 
 exclude_ranges_str = st.sidebar.text_input(
     "屏蔽指定行号区间（支持多段）",
     value="",
     placeholder="例如: 1-250, 600-630",
-    help="输入要剔除的原始行号范围（1开始），多个区间用逗号隔开。屏蔽后 CPK、箱线图、时间序列图将同步使用剩余样本重新计算。",
+    help="输入要剔除的原始行号范围（1开始），多个区间用逗号隔开。屏蔽后 CPK、箱线图、时间序列图及单行均值趋势图将同步使用剩余样本重新计算。",
 )
 
 
@@ -361,26 +361,31 @@ df_removed = df_work[~valid_mask].copy().reset_index(drop=True)
 st.sidebar.header("5️⃣ 图表标题与坐标轴设置")
 
 base_topic_name = st.sidebar.text_input(
-    "项目 / 检测参数名称（自动同步至三图标题）",
+    "项目 / 检测参数名称（自动同步至各图标题）",
     value=selected_sheet,
-    placeholder="例如: Coating density of single side",
+    placeholder="例如: 单面面密度",
 )
 
 with st.sidebar.expander("✏️ 单独微调各图表主标题（可选）", expanded=False):
   custom_title_cap = st.text_input(
       "过程能力报告标题",
       value="",
-      placeholder=f"{base_topic_name} 的过程能力报告",
+      placeholder=f"{base_topic_name} — Process Capability Report",
   )
   custom_title_box = st.text_input(
       "箱线图标题",
       value="",
-      placeholder=f"{base_topic_name} 的箱线图",
+      placeholder=f"{base_topic_name} — Box Plot",
   )
   custom_title_ts = st.text_input(
-      "时间序列图标题",
+      "多通道时间序列图标题",
       value="",
-      placeholder=f"{base_topic_name} 的时间序列图",
+      placeholder=f"{base_topic_name} — Time Series Plot",
+  )
+  custom_title_mean = st.text_input(
+      "单行均值趋势图标题",
+      value="",
+      placeholder=f"{base_topic_name}均值",
   )
 
 show_box_outliers = st.sidebar.checkbox(
@@ -388,13 +393,13 @@ show_box_outliers = st.sidebar.checkbox(
 )
 
 ts_x_mode = st.sidebar.radio(
-    "时间序列图横坐标（X轴）序号",
+    "趋势图横坐标（X轴）序号",
     options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
     index=0,
 )
 
 ts_y_mode = st.sidebar.radio(
-    "时间序列图纵坐标（Y轴）尺度",
+    "趋势图纵坐标（Y轴）尺度",
     options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
     index=0,
 )
@@ -420,14 +425,14 @@ if ts_y_mode == "自定义范围 (Manual)":
       "Y轴最大值 (Y-Max)", value=round(default_ymax + pad, 4), format="%.4f"
   )
   if ts_ymin >= ts_ymax:
-    st.sidebar.error("⚠️ 时间序列图 Y 轴最小值必须小于最大值！")
+    st.sidebar.error("⚠️ 趋势图 Y 轴最小值必须小于最大值！")
     st.stop()
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("原始数据行数", len(df_work))
-m2.metric("三图共用有效行数", len(df_clean))
+m2.metric("四图共用有效行数", len(df_clean))
 m3.metric("已全局屏蔽行数", len(df_removed))
-m4.metric("三图共用总样本数 N", len(all_valid_vals))
+m4.metric("四图共用总样本数 N", len(all_valid_vals))
 
 if len(all_valid_vals) < 2:
   st.error("过滤后有效数据点不足 2 个，无法计算标准差与过程能力，请放宽筛选条件。")
@@ -495,7 +500,7 @@ exp_wi_gt_usl = (
 )
 exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
 
-# 组装最终三图标题
+# 组装最终四图标题
 topic_clean = base_topic_name.strip() if base_topic_name.strip() else selected_sheet
 final_title_cap = (
     custom_title_cap.strip()
@@ -511,6 +516,11 @@ final_title_ts = (
     custom_title_ts.strip()
     if custom_title_ts.strip()
     else f"{topic_clean} — Time Series Plot"
+)
+final_title_mean = (
+    custom_title_mean.strip()
+    if custom_title_mean.strip()
+    else f"{topic_clean}均值"
 )
 
 
@@ -829,12 +839,123 @@ def render_time_series_plot():
   return buf
 
 
+def render_excel_style_row_mean_plot():
+  """复刻经典 Excel 折线图风格的单行均值趋势图（含目标值、规格上限、规格下限、平均值）"""
+  fig, ax = plt.subplots(figsize=(13.5, 5.6), dpi=160)
+  fig.patch.set_facecolor("white")
+  ax.set_facecolor("white")
+
+  if ts_x_mode == "保留原始表格行号 (Row Index)":
+    x_seq = df_clean["Row_Index"].to_numpy(dtype=int)
+  else:
+    x_seq = np.arange(1, len(df_clean) + 1)
+
+  y_mean_series = df_clean["_Row_Mean_"].to_numpy(dtype=float)
+
+  # Excel 经典四色系：蓝(#4472C4)目标值、橙(#ED7D31)规格上限、灰(#A5A5A5)规格下限、金黄(#FFC000)平均值
+  ax.plot(
+      x_seq,
+      np.full_like(x_seq, target, dtype=float),
+      color="#4472C4",
+      lw=2.6,
+      label="目标值",
+  )
+  ax.plot(
+      x_seq,
+      np.full_like(x_seq, usl, dtype=float),
+      color="#ED7D31",
+      lw=2.6,
+      label="规格上限",
+  )
+  ax.plot(
+      x_seq,
+      np.full_like(x_seq, lsl, dtype=float),
+      color="#A5A5A5",
+      lw=2.6,
+      label="规格下限",
+  )
+  ax.plot(
+      x_seq,
+      y_mean_series,
+      color="#FFC000",
+      lw=2.3,
+      label="平均值",
+  )
+
+  # Y轴尺度设置（自动时围绕 SPEC 留出舒适上下余量，对齐 Excel 视觉）
+  if (
+      ts_y_mode == "自定义范围 (Manual)"
+      and ts_ymin is not None
+      and ts_ymax is not None
+  ):
+    ax.set_ylim(ts_ymin, ts_ymax)
+  else:
+    spec_span = usl - lsl
+    y_low = min(lsl - 0.5 * spec_span, float(np.min(y_mean_series)) - 0.15 * spec_span)
+    y_high = max(usl + 0.25 * spec_span, float(np.max(y_mean_series)) + 0.15 * spec_span)
+    ax.set_ylim(y_low, y_high)
+
+  ax.set_xlim(x_seq[0], x_seq[-1])
+
+  # Excel 风格 X 轴垂直刻度密度（约显示 26~30 个刻度）
+  if len(x_seq) > 1:
+    tick_step = max(1, len(x_seq) // 27)
+    tick_positions = x_seq[::tick_step]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([str(v) for v in tick_positions], rotation=90, fontsize=9.5, color="#595959")
+
+  ax.tick_params(axis="y", labelsize=10, colors="#595959", length=0)
+  ax.tick_params(axis="x", length=0, pad=5)
+
+  # 仅保留浅灰色水平网格线，去除上、左、右边框（经典 Excel 图表样式）
+  ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color="#D9D9D9")
+  ax.xaxis.grid(False)
+  ax.spines["top"].set_visible(False)
+  ax.spines["right"].set_visible(False)
+  ax.spines["left"].set_visible(False)
+  ax.spines["bottom"].set_color("#D9D9D9")
+  ax.spines["bottom"].set_linewidth(0.9)
+
+  # 顶部居中大标题
+  ax.set_title(
+      final_title_mean,
+      fontsize=17,
+      fontweight="normal",
+      color="#595959",
+      pad=18,
+      fontproperties=FONT_PROP,
+  )
+
+  # 底部居中横向四列图例
+  leg = ax.legend(
+      loc="upper center",
+      bbox_to_anchor=(0.5, -0.14),
+      ncol=4,
+      frameon=False,
+      prop=FONT_PROP,
+      fontsize=11,
+      handlelength=2.4,
+      columnspacing=2.2,
+  )
+  for text in leg.get_texts():
+    text.set_color("#595959")
+
+  plt.tight_layout()
+
+  buf = io.BytesIO()
+  fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+  buf.seek(0)
+  plt.close(fig)
+  return buf
+
+
 # ==================== 8. 独立分标签页单张大图展示 ====================
-tab_cap, tab_box, tab_ts, tab_data = st.tabs([
+tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
     "1️⃣ 过程能力报告 (CPK)",
     "2️⃣ 分组箱线图 (Box Plot)",
-    "3️⃣ 时间序列图 (Time Series)",
-    "4️⃣ 清洗后数据明细与导出",
+    "3️⃣ 多通道时间序列图 (Time Series)",
+    "4️⃣ 单行均值趋势图 (Excel 风格)",
+    "5️⃣ 清洗后数据明细与导出",
 ])
 
 safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", topic_clean)
@@ -866,9 +987,20 @@ with tab_ts:
   st.image(buf_ts, width="stretch")
   buf_ts.seek(0)
   st.download_button(
-      "🖼️ 下载当前时间序列图 (.png)",
+      "🖼️ 下载当前多通道时间序列图 (.png)",
       data=buf_ts,
       file_name=f"{safe_prefix}_TimeSeries.png",
+      mime="image/png",
+  )
+
+with tab_mean:
+  buf_mean = render_excel_style_row_mean_plot()
+  st.image(buf_mean, width="stretch")
+  buf_mean.seek(0)
+  st.download_button(
+      "🖼️ 下载当前单行均值趋势图 (.png)",
+      data=buf_mean,
+      file_name=f"{safe_prefix}_RowMean_Trend.png",
       mime="image/png",
   )
 
