@@ -43,20 +43,20 @@ CHECK_ICON_SVG = (
 
 
 def render_copy_image_button(png_bytes, btn_key):
-  """渲染与参考图标一致的复制按钮，点击将 PNG 图片写入系统剪贴板"""
+  """渲染紧邻下载按钮的复制图标按钮，点击将 PNG 图片写入系统剪贴板"""
   b64_png = base64.b64encode(png_bytes).decode("ascii")
   safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", btn_key)
   html_code = f"""
-    <div style="display:flex;align-items:center;gap:6px;height:38px;">
+    <div style="display:flex;align-items:center;gap:6px;height:38px;margin:0;padding:0;">
       <button id="btn_{safe_id}" type="button" title="复制图片"
         style="display:inline-flex;align-items:center;justify-content:center;
-               width:36px;height:36px;border-radius:8px;
-               border:1px solid rgba(128,128,128,0.35);
+               width:38px;height:38px;border-radius:8px;
+               border:1px solid rgba(150,150,160,0.38);
                background:transparent;color:inherit;cursor:pointer;
-               transition:background 0.15s ease;">
+               transition:background 0.15s ease,border-color 0.15s ease;">
         {COPY_ICON_SVG}
       </button>
-      <span id="msg_{safe_id}" style="font-size:12px;opacity:0.85;"></span>
+      <span id="msg_{safe_id}" style="font-size:12px;white-space:nowrap;opacity:0.85;"></span>
     </div>
     <script>
       (function() {{
@@ -67,10 +67,12 @@ def render_copy_image_button(png_bytes, btn_key):
         const b64Data = "{b64_png}";
         if (!btn) return;
         btn.addEventListener("mouseenter", () => {{
-          btn.style.background = "rgba(128,128,128,0.14)";
+          btn.style.background = "rgba(128,128,128,0.15)";
+          btn.style.borderColor = "rgba(150,150,160,0.6)";
         }});
         btn.addEventListener("mouseleave", () => {{
           btn.style.background = "transparent";
+          btn.style.borderColor = "rgba(150,150,160,0.38)";
         }});
         btn.addEventListener("click", async () => {{
           try {{
@@ -90,7 +92,7 @@ def render_copy_image_button(png_bytes, btn_key):
                 msg.textContent = "";
               }}, 1800);
             }} else {{
-              msg.textContent = "当前环境不支持复制，请点下载";
+              msg.textContent = "不支持复制，请点下载";
             }}
           }} catch (err) {{
             msg.textContent = "复制受限，请点下载";
@@ -99,13 +101,13 @@ def render_copy_image_button(png_bytes, btn_key):
       }})();
     </script>
     """
-  components.html(html_code, height=42)
+  components.html(html_code, height=40)
 
 
 def render_chart_action_bar(png_buf, file_name, key_prefix):
-  """在图表下方同一行展示精简的「下载」按钮与「复制」图标按钮"""
+  """紧凑并排展示「下载」按钮与「复制」图标按钮，消除中间多余留白"""
   png_bytes = png_buf.getvalue()
-  a1, a2, _ = st.columns([0.95, 2.2, 6.85])
+  a1, a2, _ = st.columns([0.85, 2.15, 7.0], gap="small")
   with a1:
     st.download_button(
         "下载",
