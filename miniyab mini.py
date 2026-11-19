@@ -2,6 +2,7 @@ import io
 import os
 import re
 import urllib.request
+import zipfile
 import matplotlib.font_manager as fm
 from matplotlib.patches import Rectangle
 import matplotlib.pyplot as plt
@@ -77,8 +78,8 @@ else:
 
 plt.rcParams["axes.unicode_minus"] = False
 
-# ==================== 左侧边栏：仅保留核心数据与全局屏蔽设置 ====================
-st.sidebar.header("1️⃣ 数据源与检测列")
+# ==================== 1. 数据源与多参数分组识别 ====================
+st.sidebar.header("1️⃣ 数据源与多项目分组")
 uploaded_file = st.sidebar.file_uploader(
     "上传检测数据表 (.xlsx / .csv)", type=["xlsx", "xls", "csv"]
 )
@@ -117,7 +118,6 @@ def read_csv_compatible(file_bytes):
         last_err = e2
         continue
 
-  # 兜底：若存在个别损坏字节，使用替换模式避免整个文件读取失败
   try:
     text_fallback = file_bytes.decode("gb18030", errors="replace")
     return pd.read_csv(io.StringIO(text_fallback), sep=None, engine="python")
@@ -168,7 +168,6 @@ if df_raw.empty:
 
 df_raw.insert(0, "Row_Index", np.arange(1, len(df_raw) + 1))
 
-# 识别所有数值列
 numeric_cols_all = []
 for col in df_raw.columns:
   if col == "Row_Index":
@@ -227,9 +226,6 @@ def detect_spec_from_columns(df, all_cols):
       "lsl": detected_lsl,
       "target": detected_target,
       "usl": detected_usl,
-      "lsl_col": lsl_col,
-      "target_col": target_col,
-      "usl_col": usl_col,
       "spec_cols": spec_cols_found,
   }
 
@@ -241,30 +237,93 @@ measurement_candidates = [
 if not measurement_candidates:
   measurement_candidates = numeric_cols_all
 
-select_all_cols = st.sidebar.checkbox("全选所有检测分区/通道列", value=False)
-default_cols = (
-    measurement_candidates
-    if select_all_cols
-    else measurement_candidates[: min(10, len(measurement_candidates))]
-)
-selected_value_cols = st.sidebar.multiselect(
-    "参与分析的分区/通道列",
-    options=numeric_cols_all,
-    default=default_cols,
-)
 
-if not selected_value_cols:
-  st.warning("👈 请在左侧至少选择一列检测数值列。")
-  st.stop()
+def infer_parameter_groups(cols):
+  """按列名末尾数字/分隔符自动聚合成参数组（如 涂宽1..5 -> 涂宽）"""
+  groups = {}
+  order = []
+  for c in cols:
+    s = str(c).strip()
+    prefix = re.sub(r"[\s_\-#]*\d+$", "", s).strip()
+    if not prefix:
+      prefix = s
+    if prefix not in groups:
+      groups[prefix] = []
+      order.append(prefix)
+    groups[prefix].append(c)
+  return order, groups
 
-# ==================== 2. SPEC 规格设定（抗尖峰干扰估算） ====================
-st.sidebar.header("2️⃣ SPEC 规格设定")
+
+group_order, inferred_groups = infer_parameter_groups(measurement_candidates)
+
 dataset_key = f"{uploaded_file.name}::{selected_sheet}"
-cols_signature = tuple(selected_value_cols)
+if st.session_state.get("active_dataset_key") != dataset_key:
+  st.session_state["active_dataset_key"] = dataset_key
+  st.session_state["project_groups_map"] = {
+      k: list(v) for k, v in inferred_groups.items()
+  }
+  st.session_state["selected_projects"] = list(group_order)
+  st.session_state["project_specs_map"] = {}
+
+if "project_groups_map" not in st.session_state:
+  st.session_state["project_groups_map"] = {
+      k: list(v) for k, v in inferred_groups.items()
+  }
+if "selected_projects" not in st.session_state:
+  st.session_state["selected_projects"] = list(group_order)
+if "project_specs_map" not in st.session_state:
+  st.session_state["project_specs_map"] = {}
+
+proj_map = st.session_state["project_groups_map"]
+available_proj_names = list(proj_map.keys())
+
+valid_default_projs = [
+    p for p in st.session_state["selected_projects"] if p in available_proj_names
+]
+if not valid_default_projs and available_proj_names:
+  valid_default_projs = available_proj_names
+
+selected_projects = st.sidebar.multiselect(
+    "同时生成的项目 / 参数组（可多选）",
+    options=available_proj_names,
+    default=valid_default_projs,
+    help="例如同时选中「涂宽」、「白边」、「错位」，将在同一页面批量生成全部图像并支持一键打包下载 ZIP。",
+)
+st.session_state["selected_projects"] = selected_projects
+
+with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=False):
+  for p_name in available_proj_names:
+    updated_cols = st.multiselect(
+        f"[{p_name}] 通道列",
+        options=numeric_cols_all,
+        default=[c for c in proj_map[p_name] if c in numeric_cols_all],
+        key=f"cols_for_{dataset_key}_{p_name}",
+    )
+    if updated_cols:
+      proj_map[p_name] = updated_cols
+
+  new_grp_name = st.text_input(
+      "新增自定义项目组名称", value="", placeholder="例如: 涂宽+白边对比"
+  )
+  new_grp_cols = st.multiselect(
+      "选择新增项目组通道列", options=numeric_cols_all, default=[]
+  )
+  if st.button("➕ 添加项目组", use_container_width=True):
+    if new_grp_name.strip() and new_grp_cols:
+      g_clean = new_grp_name.strip()
+      proj_map[g_clean] = list(new_grp_cols)
+      if g_clean not in st.session_state["selected_projects"]:
+        st.session_state["selected_projects"].append(g_clean)
+      st.rerun()
+
+active_projects = [p for p in selected_projects if len(proj_map.get(p, [])) > 0]
+if not active_projects:
+  st.warning("👈 请在左侧至少选择一个包含有效通道列的项目。")
+  st.stop()
 
 
 def compute_recommended_spec(df_src, cols_sel, s_info):
-  """使用中位数与抗差标准差(MAD)估算 SPEC，避免编码器尖峰(如11205.01)带偏上下限"""
+  """使用中位数与抗差标准差(MAD)估算 SPEC，避免编码器尖峰带偏上下限"""
   vals = df_src[list(cols_sel)].to_numpy(dtype=float)
   valid_v = vals[~np.isnan(vals)]
   if len(valid_v) > 0:
@@ -290,177 +349,142 @@ def compute_recommended_spec(df_src, cols_sel, s_info):
   return float(rec_lsl), float(rec_target), float(rec_usl)
 
 
-rec_lsl, rec_target, rec_usl = compute_recommended_spec(
-    df_raw, selected_value_cols, spec_info
+specs_map = st.session_state["project_specs_map"]
+for p_name in active_projects:
+  p_key = f"{dataset_key}::{p_name}"
+  if p_key not in specs_map:
+    rl, rt, ru = compute_recommended_spec(df_raw, proj_map[p_name], spec_info)
+    specs_map[p_key] = {"lsl": rl, "target": rt, "usl": ru}
+
+# ==================== 2. 各项目 SPEC 规格设定 ====================
+st.sidebar.header("2️⃣ 各项目 SPEC 规格")
+current_focus_proj = st.sidebar.selectbox(
+    "当前编辑 SPEC 的项目",
+    options=active_projects,
+    index=0,
+    key="focus_spec_proj",
 )
-has_table_spec = any(
-    spec_info[k] is not None for k in ("lsl", "target", "usl")
-)
+focus_key = f"{dataset_key}::{current_focus_proj}"
+cur_spec = specs_map[focus_key]
 
-need_auto_fill = False
-if st.session_state.get("active_dataset_key") != dataset_key:
-  st.session_state["active_dataset_key"] = dataset_key
-  st.session_state["spec_manually_edited"] = False
-  need_auto_fill = True
-elif (
-    "spec_lsl_input" not in st.session_state
-    or "spec_usl_input" not in st.session_state
-    or st.session_state["spec_lsl_input"] >= st.session_state["spec_usl_input"]
-):
-  need_auto_fill = True
-elif (
-    not has_table_spec
-    and not st.session_state.get("spec_manually_edited", False)
-    and st.session_state.get("last_cols_signature") != cols_signature
-):
-  need_auto_fill = True
-
-st.session_state["last_cols_signature"] = cols_signature
-
-if need_auto_fill:
-  st.session_state["spec_lsl_input"] = rec_lsl
-  st.session_state["spec_target_input"] = rec_target
-  st.session_state["spec_usl_input"] = rec_usl
-
-
-def on_spec_manual_change():
-  st.session_state["spec_manually_edited"] = True
-
-
-if has_table_spec:
-  st.sidebar.caption("✅ 已从表格 SPEC 列自动获取上下限")
-else:
-  st.sidebar.caption("ℹ️ 表格无 SPEC 列，已按所选数据自动估算上下限")
-
-col_spec1, col_spec2, col_spec3 = st.sidebar.columns(3)
-lsl = col_spec1.number_input(
-    "LSL", key="spec_lsl_input", format="%.4f", on_change=on_spec_manual_change
-)
-target = col_spec2.number_input(
-    "Target",
-    key="spec_target_input",
+sc1, sc2, sc3 = st.sidebar.columns(3)
+f_lsl = sc1.number_input(
+    "LSL",
+    value=float(cur_spec["lsl"]),
     format="%.4f",
-    on_change=on_spec_manual_change,
+    key=f"num_lsl_{focus_key}",
 )
-usl = col_spec3.number_input(
-    "USL", key="spec_usl_input", format="%.4f", on_change=on_spec_manual_change
+f_target = sc2.number_input(
+    "Target",
+    value=float(cur_spec["target"]),
+    format="%.4f",
+    key=f"num_target_{focus_key}",
+)
+f_usl = sc3.number_input(
+    "USL",
+    value=float(cur_spec["usl"]),
+    format="%.4f",
+    key=f"num_usl_{focus_key}",
 )
 
-btn_label = (
-    "🔄 重新获取表格 SPEC 上下限"
-    if has_table_spec
-    else "🔄 按当前所选列重新估算上下限"
-)
-if st.sidebar.button(btn_label, use_container_width=True):
-  st.session_state["spec_manually_edited"] = False
-  st.session_state["spec_lsl_input"] = rec_lsl
-  st.session_state["spec_target_input"] = rec_target
-  st.session_state["spec_usl_input"] = rec_usl
-  st.rerun()
-
-if lsl >= usl:
-  st.sidebar.error("⚠️ LSL 必须小于 USL！请修改或点击上方按钮重置。")
+if f_lsl >= f_usl:
+  st.sidebar.error(f"⚠️ [{current_focus_proj}] LSL 必须小于 USL！")
   st.stop()
 
-# ==================== 3. 全局统一数据屏蔽引擎（单点传感器/编码器尖峰 + 行级过滤） ====================
+specs_map[focus_key] = {
+    "lsl": float(f_lsl),
+    "target": float(f_target),
+    "usl": float(f_usl),
+}
+
+if st.sidebar.button(
+    f"🔄 重新自动估算 [{current_focus_proj}] SPEC", use_container_width=True
+):
+  rl, rt, ru = compute_recommended_spec(
+      df_raw, proj_map[current_focus_proj], spec_info
+  )
+  specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
+  st.rerun()
+
+if len(active_projects) > 1:
+  with st.sidebar.expander("📋 批量查看/修改全部选中项目 SPEC", expanded=False):
+    for p_name in active_projects:
+      pk = f"{dataset_key}::{p_name}"
+      st.caption(f"**{p_name}**")
+      b1, b2, b3 = st.columns(3)
+      nl = b1.number_input(
+          "LSL",
+          value=float(specs_map[pk]["lsl"]),
+          format="%.4f",
+          key=f"batch_lsl_{pk}",
+      )
+      nt = b2.number_input(
+          "Target",
+          value=float(specs_map[pk]["target"]),
+          format="%.4f",
+          key=f"batch_tgt_{pk}",
+      )
+      nu = b3.number_input(
+          "USL",
+          value=float(specs_map[pk]["usl"]),
+          format="%.4f",
+          key=f"batch_usl_{pk}",
+      )
+      if nl < nu:
+        specs_map[pk] = {"lsl": float(nl), "target": float(nt), "usl": float(nu)}
+
+# ==================== 3. 全局统一数据屏蔽引擎 ====================
 st.sidebar.header("3️⃣ 全局样本屏蔽")
 
 spike_mode = st.sidebar.selectbox(
     "单点极端尖峰屏蔽（传感器/编码器 Bug）",
     options=[
         "智能抗差识别（偏离中位数 N 倍 MAD）",
-        "按 SPEC 公差倍数识别（超出 Target ± N×公差）",
+        "按各项目 SPEC 公差倍数识别",
         "自定义单点有效数值区间",
         "不启用单点屏蔽",
     ],
     index=0,
-    help="专门过滤某行个别通道混入的编码器/传感器错误值（如 11205.01），避免拉歪整体均值与箱线图。",
+    help="专门过滤某行个别通道混入的编码器/传感器错误值，避免拉歪整体均值与箱线图。",
 )
 
-df_work = df_raw.copy()
-sub_vals_raw = df_work[selected_value_cols].to_numpy(dtype=float)
-spike_outlier_mask = np.zeros_like(sub_vals_raw, dtype=bool)
-
-if spike_mode != "不启用单点屏蔽":
+spike_param_val = 15.0
+pt_min_val, pt_max_val = None, None
+if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
   sp_c1, sp_c2 = st.sidebar.columns([1.15, 1.35])
-  if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
-    mad_mult = sp_c1.number_input(
-        "MAD 阈值倍数",
-        min_value=3.0,
-        max_value=200.0,
-        value=15.0,
-        step=1.0,
-        help="越小越严格；15 倍可精准抓出编码器跳变而不误伤正常波动。",
-    )
-    valid_flat = sub_vals_raw[~np.isnan(sub_vals_raw)]
-    if len(valid_flat) > 0:
-      med_all = float(np.median(valid_flat))
-      mad_all = float(np.median(np.abs(valid_flat - med_all)))
-      robust_sigma = mad_all * 1.4826
-      if robust_sigma <= 1e-12:
-        q75, q25 = np.percentile(valid_flat, [75, 25])
-        robust_sigma = max((q75 - q25) / 1.349, (usl - lsl) / 6.0, 1e-6)
-      low_bound = med_all - mad_mult * robust_sigma
-      high_bound = med_all + mad_mult * robust_sigma
-      spike_outlier_mask = (~np.isnan(sub_vals_raw)) & (
-          (sub_vals_raw < low_bound) | (sub_vals_raw > high_bound)
-      )
-  elif spike_mode == "按 SPEC 公差倍数识别（超出 Target ± N×公差）":
-    spec_mult = sp_c1.number_input(
-        "公差跨度倍数",
-        min_value=1.0,
-        max_value=50.0,
-        value=3.0,
-        step=0.5,
-    )
-    spec_span = usl - lsl
-    low_bound = target - spec_mult * spec_span
-    high_bound = target + spec_mult * spec_span
-    spike_outlier_mask = (~np.isnan(sub_vals_raw)) & (
-        (sub_vals_raw < low_bound) | (sub_vals_raw > high_bound)
-    )
-  else:
-    pt_min = sp_c1.number_input(
-        "单点最小值", value=float(lsl - (usl - lsl)), format="%.4f"
-    )
-    pt_max = sp_c2.number_input(
-        "单点最大值", value=float(usl + (usl - lsl)), format="%.4f"
-    )
-    spike_outlier_mask = (~np.isnan(sub_vals_raw)) & (
-        (sub_vals_raw < pt_min) | (sub_vals_raw > pt_max)
-    )
-
-  if spike_mode != "自定义单点有效数值区间":
-    spike_action = sp_c2.selectbox(
-        "异常点处理方式",
-        options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
-        index=0,
-    )
-  else:
-    spike_action = st.sidebar.selectbox(
-        "异常点处理方式",
-        options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
-        index=0,
-    )
+  spike_param_val = sp_c1.number_input(
+      "MAD 阈值倍数", min_value=3.0, max_value=200.0, value=15.0, step=1.0
+  )
+  spike_action = sp_c2.selectbox(
+      "异常点处理方式",
+      options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
+      index=0,
+  )
+elif spike_mode == "按各项目 SPEC 公差倍数识别":
+  sp_c1, sp_c2 = st.sidebar.columns([1.15, 1.35])
+  spike_param_val = sp_c1.number_input(
+      "公差跨度倍数", min_value=1.0, max_value=50.0, value=3.0, step=0.5
+  )
+  spike_action = sp_c2.selectbox(
+      "异常点处理方式",
+      options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
+      index=0,
+  )
+elif spike_mode == "自定义单点有效数值区间":
+  sp_c1, sp_c2 = st.sidebar.columns(2)
+  pt_min_val = sp_c1.number_input(
+      "单点最小值", value=float(f_lsl - (f_usl - f_lsl)), format="%.4f"
+  )
+  pt_max_val = sp_c2.number_input(
+      "单点最大值", value=float(f_usl + (f_usl - f_lsl)), format="%.4f"
+  )
+  spike_action = st.sidebar.selectbox(
+      "异常点处理方式",
+      options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
+      index=0,
+  )
 else:
   spike_action = "置空该单元格（保留行内其他列）"
-
-masked_cell_count = int(np.sum(spike_outlier_mask))
-rows_with_spike_mask = np.any(spike_outlier_mask, axis=1)
-
-if masked_cell_count > 0:
-  if spike_action == "置空该单元格（保留行内其他列）":
-    cleaned_vals = sub_vals_raw.copy()
-    cleaned_vals[spike_outlier_mask] = np.nan
-    for idx_c, col in enumerate(selected_value_cols):
-      df_work[col] = cleaned_vals[:, idx_c]
-    st.sidebar.caption(
-        f"🛡️ 已自动置空 **{masked_cell_count}** 个传感器/编码器异常单元格"
-    )
-  else:
-    st.sidebar.caption(
-        f"🛡️ 已标记 **{int(np.sum(rows_with_spike_mask))}** 行含异常单点的数据行待剔除"
-    )
 
 exclude_ranges_str = st.sidebar.text_input(
     "屏蔽行号区间（支持多段）",
@@ -503,53 +527,24 @@ filter_mode = st.sidebar.selectbox(
     "行均值数值筛选规则",
     options=[
         "不屏蔽（保留全部行）",
-        "按 SPEC 范围过滤（超出 [LSL, USL] 屏蔽）",
+        "按各项目 SPEC 范围过滤",
         "按自定义范围过滤（超出设定区间屏蔽）",
     ],
     index=1,
 )
 
-row_mean = df_work[selected_value_cols].mean(axis=1)
-df_work["_Row_Mean_"] = row_mean
-
-mask_not_nan = df_work["_Row_Mean_"].notna()
-mask_not_in_range = ~df_work["Row_Index"].isin(excluded_rows_set)
-mask_no_spike_row = (
-    pd.Series(~rows_with_spike_mask, index=df_work.index)
-    if (masked_cell_count > 0 and spike_action == "剔除包含异常点的整行")
-    else pd.Series(True, index=df_work.index)
-)
-mask_value_ok = pd.Series(True, index=df_work.index)
-
-if filter_mode == "按 SPEC 范围过滤（超出 [LSL, USL] 屏蔽）":
-  mask_value_ok = (df_work["_Row_Mean_"] >= lsl) & (df_work["_Row_Mean_"] <= usl)
-elif filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
+custom_min, custom_max = None, None
+if filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
   c_min, c_max = st.sidebar.columns(2)
   custom_min = c_min.number_input(
-      "允许最小值", value=float(lsl), format="%.4f"
+      "允许最小值", value=float(f_lsl), format="%.4f"
   )
   custom_max = c_max.number_input(
-      "允许最大值", value=float(usl), format="%.4f"
+      "允许最大值", value=float(f_usl), format="%.4f"
   )
   if custom_min >= custom_max:
     st.sidebar.error("⚠️ 最小值必须小于最大值！")
     st.stop()
-  mask_value_ok = (df_work["_Row_Mean_"] >= custom_min) & (
-      df_work["_Row_Mean_"] <= custom_max
-  )
-
-valid_mask = (
-    mask_not_nan & mask_not_in_range & mask_no_spike_row & mask_value_ok
-)
-df_clean = df_work[valid_mask].copy().reset_index(drop=True)
-df_removed = df_raw[~valid_mask].copy().reset_index(drop=True)
-
-raw_sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
-raw_all_valid_vals = raw_sub_matrix[~np.isnan(raw_sub_matrix)]
-
-if len(raw_all_valid_vals) < 2:
-  st.error("过滤后有效数据点不足 2 个，无法计算标准差与过程能力，请放宽筛选条件。")
-  st.stop()
 
 
 def compute_within_std(mat, flat_vals):
@@ -569,144 +564,199 @@ def compute_within_std(mat, flat_vals):
   return m_mr / 1.12838 if m_mr > 0 else s_ov
 
 
-orig_mean = float(np.mean(raw_all_valid_vals))
-orig_std_within = compute_within_std(raw_sub_matrix, raw_all_valid_vals)
+def build_project_dataset(proj_cols, p_lsl, p_target, p_usl):
+  """为单个项目组生成清洗后数据、被剔除行与异常单点统计"""
+  df_w = df_raw.copy()
+  sub_raw = df_w[proj_cols].to_numpy(dtype=float)
+  sp_mask = np.zeros_like(sub_raw, dtype=bool)
 
-# ==================== 左侧最底部（隐蔽收起）：过程波动校准 ====================
-st.sidebar.markdown("---")
-with st.sidebar.expander("⚙️ 高级过程波动校准", expanded=False):
-  enable_sigma_tuning = st.checkbox(
-      "启用自定义西格玛校准（全图与导出表同步）", value=False
-  )
-  tuning_mode = st.radio(
-      "校准方式",
-      options=["直接指定目标西格玛 (σ)", "按目标 CPK 自动推算西格玛"],
-      index=0,
-  )
-  center_align_pct = st.slider(
-      "均值向 Target 居中比例 (%)",
-      min_value=0,
-      max_value=100,
-      value=0,
-      step=5,
-  )
-  adjusted_mean = orig_mean + (target - orig_mean) * (center_align_pct / 100.0)
+  if spike_mode != "不启用单点屏蔽":
+    if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
+      v_flat = sub_raw[~np.isnan(sub_raw)]
+      if len(v_flat) > 0:
+        med_v = float(np.median(v_flat))
+        mad_v = float(np.median(np.abs(v_flat - med_v)))
+        r_sig = mad_v * 1.4826
+        if r_sig <= 1e-12:
+          q75, q25 = np.percentile(v_flat, [75, 25])
+          r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
+        low_b = med_v - spike_param_val * r_sig
+        high_b = med_v + spike_param_val * r_sig
+        sp_mask = (~np.isnan(sub_raw)) & (
+            (sub_raw < low_b) | (sub_raw > high_b)
+        )
+    elif spike_mode == "按各项目 SPEC 公差倍数识别":
+      sp_span = p_usl - p_lsl
+      low_b = p_target - spike_param_val * sp_span
+      high_b = p_target + spike_param_val * sp_span
+      sp_mask = (~np.isnan(sub_raw)) & ((sub_raw < low_b) | (sub_raw > high_b))
+    elif (
+        spike_mode == "自定义单点有效数值区间"
+        and pt_min_val is not None
+        and pt_max_val is not None
+    ):
+      sp_mask = (~np.isnan(sub_raw)) & (
+          (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
+      )
 
-  if tuning_mode == "直接指定目标西格玛 (σ)":
-    default_sigma = round(max(orig_std_within * 0.7, 0.0001), 6)
-    target_sigma_within = st.number_input(
-        "目标组内西格玛 (Target Within σ)",
-        min_value=0.000001,
-        value=default_sigma,
-        format="%.6f",
+  cell_cnt = int(np.sum(sp_mask))
+  row_has_sp = np.any(sp_mask, axis=1)
+
+  if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
+    cleaned = sub_raw.copy()
+    cleaned[sp_mask] = np.nan
+    for idx_c, c_name in enumerate(proj_cols):
+      df_w[c_name] = cleaned[:, idx_c]
+
+  df_w["_Row_Mean_"] = df_w[proj_cols].mean(axis=1)
+
+  m_not_nan = df_w["_Row_Mean_"].notna()
+  m_not_rng = ~df_w["Row_Index"].isin(excluded_rows_set)
+  m_no_sp_row = (
+      pd.Series(~row_has_sp, index=df_w.index)
+      if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
+      else pd.Series(True, index=df_w.index)
+  )
+  m_val_ok = pd.Series(True, index=df_w.index)
+
+  if filter_mode == "按各项目 SPEC 范围过滤":
+    m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
+  elif (
+      filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
+      and custom_min is not None
+      and custom_max is not None
+  ):
+    m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
+        df_w["_Row_Mean_"] <= custom_max
     )
-  else:
-    target_cpk_goal = st.selectbox(
-        "目标 CPK 标准",
-        options=[1.33, 1.50, 1.67, 2.00],
-        index=0,
-    )
-    min_spec_dist = min(usl - adjusted_mean, adjusted_mean - lsl)
-    if min_spec_dist <= 0:
-      st.warning("⚠️ 当前均值超出规格限，请调高居中比例。")
-      target_sigma_within = orig_std_within
-    else:
-      target_sigma_within = min_spec_dist / (3.0 * target_cpk_goal)
-    st.caption(f"自动换算所需组内 σ ≈ `{target_sigma_within:.6f}`")
 
-if enable_sigma_tuning and orig_std_within > 0:
-  scale_ratio = target_sigma_within / orig_std_within
-  for col in selected_value_cols:
-    df_clean[col] = adjusted_mean + (df_clean[col] - orig_mean) * scale_ratio
-  df_clean["_Row_Mean_"] = df_clean[selected_value_cols].mean(axis=1)
+  v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
+  df_c = df_w[v_mask].copy().reset_index(drop=True)
+  df_r = df_raw[~v_mask].copy().reset_index(drop=True)
 
-sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
-all_valid_vals = sub_matrix[~np.isnan(sub_matrix)]
+  s_mat = df_c[proj_cols].to_numpy(dtype=float)
+  v_vals = s_mat[~np.isnan(s_mat)]
+  if len(v_vals) < 2:
+    return None
 
-# ==================== Minitab 核心统计计算 ====================
-total_n = len(all_valid_vals)
-sample_mean = float(np.mean(all_valid_vals))
-std_overall = float(np.std(all_valid_vals, ddof=1))
-std_within = compute_within_std(sub_matrix, all_valid_vals)
-k_cols = len(selected_value_cols)
+  s_mean = float(np.mean(v_vals))
+  s_ov = float(np.std(v_vals, ddof=1))
+  s_wi = compute_within_std(s_mat, v_vals)
+  tot_n = len(v_vals)
 
-cp = (usl - lsl) / (6.0 * std_within) if std_within > 0 else np.nan
-cpl = (sample_mean - lsl) / (3.0 * std_within) if std_within > 0 else np.nan
-cpu = (usl - sample_mean) / (3.0 * std_within) if std_within > 0 else np.nan
-cpk = min(cpl, cpu)
+  cp_v = (p_usl - p_lsl) / (6.0 * s_wi) if s_wi > 0 else np.nan
+  cpl_v = (s_mean - p_lsl) / (3.0 * s_wi) if s_wi > 0 else np.nan
+  cpu_v = (p_usl - s_mean) / (3.0 * s_wi) if s_wi > 0 else np.nan
+  cpk_v = min(cpl_v, cpu_v)
 
-pp = (usl - lsl) / (6.0 * std_overall) if std_overall > 0 else np.nan
-ppl = (sample_mean - lsl) / (3.0 * std_overall) if std_overall > 0 else np.nan
-ppu = (usl - sample_mean) / (3.0 * std_overall) if std_overall > 0 else np.nan
-ppk = min(ppl, ppu)
+  pp_v = (p_usl - p_lsl) / (6.0 * s_ov) if s_ov > 0 else np.nan
+  ppl_v = (s_mean - p_lsl) / (3.0 * s_ov) if s_ov > 0 else np.nan
+  ppu_v = (p_usl - s_mean) / (3.0 * s_ov) if s_ov > 0 else np.nan
+  ppk_v = min(ppl_v, ppu_v)
 
-obs_lt_lsl = float(np.sum(all_valid_vals < lsl)) / total_n * 1e6
-obs_gt_usl = float(np.sum(all_valid_vals > usl)) / total_n * 1e6
-obs_total = obs_lt_lsl + obs_gt_usl
+  obs_lt = float(np.sum(v_vals < p_lsl)) / tot_n * 1e6
+  obs_gt = float(np.sum(v_vals > p_usl)) / tot_n * 1e6
+  obs_tot = obs_lt + obs_gt
 
-exp_ov_lt_lsl = (
-    stats.norm.cdf((lsl - sample_mean) / std_overall) * 1e6
-    if std_overall > 0
-    else 0.0
-)
-exp_ov_gt_usl = (
-    (1.0 - stats.norm.cdf((usl - sample_mean) / std_overall)) * 1e6
-    if std_overall > 0
-    else 0.0
-)
-exp_ov_total = exp_ov_lt_lsl + exp_ov_gt_usl
+  exp_ov_lt = (
+      stats.norm.cdf((p_lsl - s_mean) / s_ov) * 1e6 if s_ov > 0 else 0.0
+  )
+  exp_ov_gt = (
+      (1.0 - stats.norm.cdf((p_usl - s_mean) / s_ov)) * 1e6 if s_ov > 0 else 0.0
+  )
+  exp_ov_tot = exp_ov_lt + exp_ov_gt
 
-exp_wi_lt_lsl = (
-    stats.norm.cdf((lsl - sample_mean) / std_within) * 1e6
-    if std_within > 0
-    else 0.0
-)
-exp_wi_gt_usl = (
-    (1.0 - stats.norm.cdf((usl - sample_mean) / std_within)) * 1e6
-    if std_within > 0
-    else 0.0
-)
-exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
+  exp_wi_lt = (
+      stats.norm.cdf((p_lsl - s_mean) / s_wi) * 1e6 if s_wi > 0 else 0.0
+  )
+  exp_wi_gt = (
+      (1.0 - stats.norm.cdf((p_usl - s_mean) / s_wi)) * 1e6 if s_wi > 0 else 0.0
+  )
+  exp_wi_tot = exp_wi_lt + exp_wi_gt
 
-# ==================== 右侧主工作区：顶部概览与紧凑标题栏 ====================
+  return {
+      "cols": proj_cols,
+      "lsl": p_lsl,
+      "target": p_target,
+      "usl": p_usl,
+      "df_clean": df_c,
+      "df_removed": df_r,
+      "masked_cells": cell_cnt,
+      "all_valid_vals": v_vals,
+      "total_n": tot_n,
+      "sample_mean": s_mean,
+      "std_overall": s_ov,
+      "std_within": s_wi,
+      "cp": cp_v,
+      "cpl": cpl_v,
+      "cpu": cpu_v,
+      "cpk": cpk_v,
+      "pp": pp_v,
+      "ppl": ppl_v,
+      "ppu": ppu_v,
+      "ppk": ppk_v,
+      "obs_lt_lsl": obs_lt,
+      "obs_gt_usl": obs_gt,
+      "obs_total": obs_tot,
+      "exp_ov_lt_lsl": exp_ov_lt,
+      "exp_ov_gt_usl": exp_ov_gt,
+      "exp_ov_total": exp_ov_tot,
+      "exp_wi_lt_lsl": exp_wi_lt,
+      "exp_wi_gt_usl": exp_wi_gt,
+      "exp_wi_total": exp_wi_tot,
+  }
+
+
+project_bundles = {}
+for p_name in active_projects:
+  pk = f"{dataset_key}::{p_name}"
+  sp = specs_map[pk]
+  b_data = build_project_dataset(
+      proj_map[p_name], sp["lsl"], sp["target"], sp["usl"]
+  )
+  if b_data is not None:
+    project_bundles[p_name] = b_data
+
+if not project_bundles:
+  st.error("当前筛选条件下，所选项目有效数据点不足 2 个，请放宽过滤规则。")
+  st.stop()
+
+ready_projects = list(project_bundles.keys())
+
+# ==================== 顶部栏：标题、浅灰外边框开关与多项目一键 ZIP 打包 ====================
 st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("原始数据行数", len(df_work))
-m2.metric("有效分析行数", len(df_clean))
-m3.metric("已整行屏蔽数", len(df_removed))
-m4.metric("已屏蔽异常单点", masked_cell_count)
-m5.metric("总有效样本 N", len(all_valid_vals))
 
 top_bar1, top_bar2 = st.columns([3.5, 1.2])
 with top_bar1:
-  with st.expander("✏️ 自定义项目名称与各图表主标题（点击展开）", expanded=False):
-    t_col0, t_col1, t_col2 = st.columns(3)
-    base_topic_name = t_col0.text_input(
-        "项目 / 检测参数名称（自动同步至各图）",
-        value=selected_sheet,
-        placeholder="例如: Coating width A",
+  with st.expander("✏️ 自定义各项目图表主标题（点击展开）", expanded=False):
+    title_target_proj = st.selectbox(
+        "选择要自定义标题的项目", options=ready_projects, key="title_proj_sel"
     )
-    custom_title_cap = t_col1.text_input(
+    t_c1, t_c2 = st.columns(2)
+    c_cap = t_c1.text_input(
         "能力报告标题（留空自动生成）",
         value="",
-        placeholder=f"{base_topic_name} — Process Capability Report",
+        placeholder=f"{title_target_proj} — Process Capability Report",
+        key=f"t_cap_{title_target_proj}",
     )
-    custom_title_box = t_col2.text_input(
+    c_box = t_c2.text_input(
         "箱线图标题（留空自动生成）",
         value="",
-        placeholder=f"{base_topic_name} — Box Plot",
+        placeholder=f"{title_target_proj} — Box Plot",
+        key=f"t_box_{title_target_proj}",
     )
-    t_col3, t_col4 = st.columns(2)
-    custom_title_ts = t_col3.text_input(
+    t_c3, t_c4 = st.columns(2)
+    c_ts = t_c3.text_input(
         "时间序列图标题（留空自动生成）",
         value="",
-        placeholder=f"{base_topic_name} — Time Series Plot",
+        placeholder=f"{title_target_proj} — Time Series Plot",
+        key=f"t_ts_{title_target_proj}",
     )
-    custom_title_mean = t_col4.text_input(
+    c_mean = t_c4.text_input(
         "单行均值图标题（留空自动生成）",
         value="",
-        placeholder=f"{base_topic_name}均值",
+        placeholder=f"{title_target_proj}均值",
+        key=f"t_mean_{title_target_proj}",
     )
 
 with top_bar2:
@@ -716,29 +766,18 @@ with top_bar2:
       help="为导出图片添加浅灰色矩形边框，方便粘贴至 PPT 多图排版对齐",
   )
 
-topic_clean = (
-    base_topic_name.strip() if base_topic_name.strip() else selected_sheet
-)
-final_title_cap = (
-    custom_title_cap.strip()
-    if custom_title_cap.strip()
-    else f"{topic_clean} — Process Capability Report"
-)
-final_title_box = (
-    custom_title_box.strip()
-    if custom_title_box.strip()
-    else f"{topic_clean} — Box Plot"
-)
-final_title_ts = (
-    custom_title_ts.strip()
-    if custom_title_ts.strip()
-    else f"{topic_clean} — Time Series Plot"
-)
-final_title_mean = (
-    custom_title_mean.strip()
-    if custom_title_mean.strip()
-    else f"{topic_clean}均值"
-)
+
+def get_project_titles(p_name):
+  cap_in = st.session_state.get(f"t_cap_{p_name}", "").strip()
+  box_in = st.session_state.get(f"t_box_{p_name}", "").strip()
+  ts_in = st.session_state.get(f"t_ts_{p_name}", "").strip()
+  mean_in = st.session_state.get(f"t_mean_{p_name}", "").strip()
+  return (
+      cap_in if cap_in else f"{p_name} — Process Capability Report",
+      box_in if box_in else f"{p_name} — Box Plot",
+      ts_in if ts_in else f"{p_name} — Time Series Plot",
+      mean_in if mean_in else f"{p_name}均值",
+  )
 
 
 # ==================== 统一图像浅灰色外边框封装 ====================
@@ -787,7 +826,6 @@ def save_fig_with_border(fig, use_tight=False):
   return buf
 
 
-# ==================== 独立图表比例选择器组件 ====================
 ASPECT_OPTIONS = [
     "4 : 3（PPT 多图/四宫格）",
     "3 : 2（紧凑双图对比）",
@@ -837,10 +875,9 @@ def render_aspect_selector(container_col, key_prefix, default_idx=0):
   return fw, fh, px_w
 
 
-# ==================== 图表渲染函数（自适应画布比例） ====================
-def render_capability_plot(w_in, h_in):
+# ==================== 单项目四张图渲染函数 ====================
+def render_capability_plot(b, title_str, w_in, h_in):
   fig = plt.figure(figsize=(w_in, h_in), dpi=170)
-
   scale_f = min(w_in / 9.6, h_in / 7.2)
   font_panel = max(7.2, 8.3 * scale_f)
   font_title = max(11.5, 13.5 * scale_f)
@@ -853,7 +890,6 @@ def render_capability_plot(w_in, h_in):
       wspace=0.06,
       hspace=0.22,
   )
-
   ax_left = fig.add_subplot(gs[0, 0])
   ax_mid = fig.add_subplot(gs[0, 1])
   ax_right = fig.add_subplot(gs[0, 2])
@@ -864,9 +900,16 @@ def render_capability_plot(w_in, h_in):
   for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
     ax_tmp.axis("off")
 
-  bins_count = min(38, max(14, int(np.sqrt(total_n) * 0.55)))
+  all_v = b["all_valid_vals"]
+  tot_n = b["total_n"]
+  s_mean = b["sample_mean"]
+  s_ov = b["std_overall"]
+  s_wi = b["std_within"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+  bins_count = min(38, max(14, int(np.sqrt(tot_n) * 0.55)))
   counts, _, _ = ax_mid.hist(
-      all_valid_vals,
+      all_v,
       bins=bins_count,
       density=True,
       color="#78A2CC",
@@ -875,40 +918,38 @@ def render_capability_plot(w_in, h_in):
       alpha=0.92,
   )
 
-  span = usl - lsl
-  x_min_c = min(lsl - 0.18 * span, float(np.min(all_valid_vals)) - 0.08 * span)
-  x_max_c = max(usl + 0.18 * span, float(np.max(all_valid_vals)) + 0.08 * span)
+  span = p_usl - p_lsl
+  x_min_c = min(p_lsl - 0.18 * span, float(np.min(all_v)) - 0.08 * span)
+  x_max_c = max(p_usl + 0.18 * span, float(np.max(all_v)) + 0.08 * span)
   x_grid = np.linspace(x_min_c, x_max_c, 500)
 
   line_ov, line_wi = None, None
-  if std_overall > 0:
+  if s_ov > 0:
     (line_ov,) = ax_mid.plot(
         x_grid,
-        stats.norm.pdf(x_grid, sample_mean, std_overall),
+        stats.norm.pdf(x_grid, s_mean, s_ov),
         color="#B91C1C",
         lw=1.8,
         ls="-",
         label="Overall",
     )
-  if std_within > 0:
+  if s_wi > 0:
     (line_wi,) = ax_mid.plot(
         x_grid,
-        stats.norm.pdf(x_grid, sample_mean, std_within),
+        stats.norm.pdf(x_grid, s_mean, s_wi),
         color="#374151",
         lw=1.6,
         ls="--",
         label="Within",
     )
 
-  ax_mid.axvline(lsl, color="#DC2626", ls="--", lw=1.15)
-  ax_mid.axvline(usl, color="#DC2626", ls="--", lw=1.15)
-  ax_mid.axvline(target, color="#16A34A", ls=":", lw=1.1)
+  ax_mid.axvline(p_lsl, color="#DC2626", ls="--", lw=1.15)
+  ax_mid.axvline(p_usl, color="#DC2626", ls="--", lw=1.15)
+  ax_mid.axvline(p_target, color="#16A34A", ls=":", lw=1.1)
 
   y_peak = max(
       float(np.max(counts)) if len(counts) else 1.0,
-      float(np.max(stats.norm.pdf(x_grid, sample_mean, std_within)))
-      if std_within > 0
-      else 1.0,
+      float(np.max(stats.norm.pdf(x_grid, s_mean, s_wi))) if s_wi > 0 else 1.0,
   )
   ax_mid.set_ylim(0, y_peak * 1.14)
   ax_mid.set_yticks([])
@@ -920,9 +961,9 @@ def render_capability_plot(w_in, h_in):
 
   lbl_sz = max(7.5, 8.5 * scale_f)
   ax_mid.text(
-      lsl,
+      p_lsl,
       y_peak * 1.16,
-      f"LSL\n{lsl:.2f}",
+      f"LSL\n{p_lsl:.2f}",
       color="#B91C1C",
       ha="center",
       va="bottom",
@@ -930,9 +971,9 @@ def render_capability_plot(w_in, h_in):
       fontweight="bold",
   )
   ax_mid.text(
-      usl,
+      p_usl,
       y_peak * 1.16,
-      f"USL\n{usl:.2f}",
+      f"USL\n{p_usl:.2f}",
       color="#B91C1C",
       ha="center",
       va="bottom",
@@ -940,9 +981,9 @@ def render_capability_plot(w_in, h_in):
       fontweight="bold",
   )
   ax_mid.text(
-      target,
+      p_target,
       y_peak * 1.16,
-      f"Target\n{target:.2f}",
+      f"Target\n{p_target:.2f}",
       color="#15803D",
       ha="center",
       va="bottom",
@@ -952,15 +993,15 @@ def render_capability_plot(w_in, h_in):
   left_text = (
       f"Process Data\n"
       f"----------------------\n"
-      f"LSL          {lsl:.4f}\n"
-      f"Target       {target:.4f}\n"
-      f"USL          {usl:.4f}\n"
-      f"Mean         {sample_mean:.4f}\n"
-      f"Sample N     {total_n}\n"
-      f"Valid Rows   {len(df_clean)}\n"
-      f"Subgroup     {k_cols}\n"
-      f"StDev(Ov)    {std_overall:.5f}\n"
-      f"StDev(Wi)    {std_within:.5f}"
+      f"LSL          {p_lsl:.4f}\n"
+      f"Target       {p_target:.4f}\n"
+      f"USL          {p_usl:.4f}\n"
+      f"Mean         {s_mean:.4f}\n"
+      f"Sample N     {tot_n}\n"
+      f"Valid Rows   {len(b['df_clean'])}\n"
+      f"Subgroup     {len(b['cols'])}\n"
+      f"StDev(Ov)    {s_ov:.5f}\n"
+      f"StDev(Wi)    {s_wi:.5f}"
   )
   ax_left.text(
       0.95,
@@ -977,16 +1018,16 @@ def render_capability_plot(w_in, h_in):
   right_text = (
       f"Overall Capability\n"
       f"------------------\n"
-      f"Pp        {pp:.2f}\n"
-      f"PPL       {ppl:.2f}\n"
-      f"PPU       {ppu:.2f}\n"
-      f"Ppk       {ppk:.2f}\n\n"
+      f"Pp        {b['pp']:.2f}\n"
+      f"PPL       {b['ppl']:.2f}\n"
+      f"PPU       {b['ppu']:.2f}\n"
+      f"Ppk       {b['ppk']:.2f}\n\n"
       f"Potential (Within)\n"
       f"------------------\n"
-      f"Cp        {cp:.2f}\n"
-      f"CPL       {cpl:.2f}\n"
-      f"CPU       {cpu:.2f}\n"
-      f"Cpk       {cpk:.2f}"
+      f"Cp        {b['cp']:.2f}\n"
+      f"CPL       {b['cpl']:.2f}\n"
+      f"CPU       {b['cpu']:.2f}\n"
+      f"Cpk       {b['cpk']:.2f}"
   )
   ax_right.text(
       0.06,
@@ -1015,9 +1056,9 @@ def render_capability_plot(w_in, h_in):
   ppm_text = (
       f"Performance (PPM)        Observed    Exp. Overall    Exp. Within\n"
       f"----------------------------------------------------------------\n"
-      f"PPM < LSL               {obs_lt_lsl:9.2f}       {exp_ov_lt_lsl:9.2f}      {exp_wi_lt_lsl:9.2f}\n"
-      f"PPM > USL               {obs_gt_usl:9.2f}       {exp_ov_gt_usl:9.2f}      {exp_wi_gt_usl:9.2f}\n"
-      f"Total PPM               {obs_total:9.2f}       {exp_ov_total:9.2f}      {exp_wi_total:9.2f}"
+      f"PPM < LSL               {b['obs_lt_lsl']:9.2f}       {b['exp_ov_lt_lsl']:9.2f}      {b['exp_wi_lt_lsl']:9.2f}\n"
+      f"PPM > USL               {b['obs_gt_usl']:9.2f}       {b['exp_ov_gt_usl']:9.2f}      {b['exp_wi_gt_usl']:9.2f}\n"
+      f"Total PPM               {b['obs_total']:9.2f}       {b['exp_ov_total']:9.2f}      {b['exp_wi_total']:9.2f}"
   )
   ax_bot_mid.text(
       0.5,
@@ -1035,18 +1076,19 @@ def render_capability_plot(w_in, h_in):
   )
 
   fig.suptitle(
-      final_title_cap,
+      title_str,
       fontsize=font_title,
       fontweight="bold",
       y=0.96,
       fontproperties=FONT_PROP,
   )
   plt.subplots_adjust(left=0.025, right=0.975, top=0.835, bottom=0.045)
-
   return save_fig_with_border(fig, use_tight=False)
 
 
 def render_box_plot(
+    b,
+    title_str,
     w_in,
     h_in,
     show_outliers=False,
@@ -1055,11 +1097,12 @@ def render_box_plot(
     decimals=4,
 ):
   fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+  df_c = b["df_clean"]
+  p_cols = b["cols"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
 
-  box_data = [
-      df_clean[c].dropna().to_numpy(dtype=float) for c in selected_value_cols
-  ]
-  box_labels = [str(c) for c in selected_value_cols]
+  box_data = [df_c[c].dropna().to_numpy(dtype=float) for c in p_cols]
+  box_labels = [str(c) for c in p_cols]
   n_boxes = len(box_data)
   box_width = 0.42 if n_boxes <= 15 else 0.36
 
@@ -1081,9 +1124,9 @@ def render_box_plot(
       ),
   )
 
-  ax.axhline(usl, color="#DC2626", ls="--", lw=1.2)
-  ax.axhline(target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
-  ax.axhline(lsl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+  ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
 
   width_scale = min(w_in / 11.0, 1.15)
   label_font_size = (
@@ -1172,9 +1215,9 @@ def render_box_plot(
 
   ax_r = ax.twinx()
   ax_r.set_ylim(ax.get_ylim())
-  ax_r.set_yticks([lsl, target, usl])
+  ax_r.set_yticks([p_lsl, p_target, p_usl])
   ax_r.set_yticklabels(
-      [f"{lsl}", f"{target}", f"{usl}"],
+      [f"{p_lsl}", f"{p_target}", f"{p_usl}"],
       color="#B91C1C",
       fontsize=8.8,
       fontweight="bold",
@@ -1186,7 +1229,7 @@ def render_box_plot(
     ax_r.spines[sp].set_visible(False)
 
   ax.set_title(
-      final_title_box,
+      title_str,
       fontsize=max(11.5, 13.5 * width_scale),
       fontweight="bold",
       pad=12,
@@ -1200,28 +1243,30 @@ def render_box_plot(
     lbl.set_fontproperties(FONT_PROP)
   ax.grid(True, ls=":", alpha=0.45)
   plt.tight_layout(pad=1.2)
-
   return save_fig_with_border(fig, use_tight=False)
 
 
 def render_time_series_plot(
-    w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
+    b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
 ):
   fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+  df_c = b["df_clean"]
+  p_cols = b["cols"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
 
   if x_mode_opt == "保留原始表格行号 (Row Index)":
-    x_seq = df_clean["Row_Index"].to_numpy(dtype=int)
+    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
     x_label_text = "Original Row Index"
   else:
-    x_seq = np.arange(1, len(df_clean) + 1)
+    x_seq = np.arange(1, len(df_c) + 1)
     x_label_text = "Filtered Sequence Index (1..N)"
 
   markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
   cmap = plt.get_cmap("tab20")
   step_mark = max(1, len(x_seq) // 250)
 
-  for idx, col_name in enumerate(selected_value_cols):
-    y_col = df_clean[col_name].to_numpy(dtype=float)
+  for idx, col_name in enumerate(p_cols):
+    y_col = df_c[col_name].to_numpy(dtype=float)
     ax.plot(
         x_seq,
         y_col,
@@ -1234,9 +1279,9 @@ def render_time_series_plot(
         label=str(col_name),
     )
 
-  ax.axhline(usl, color="#DC2626", ls="--", lw=1.2)
-  ax.axhline(target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
-  ax.axhline(lsl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+  ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
 
   if (
       y_mode_opt == "自定义范围 (Manual)"
@@ -1248,7 +1293,7 @@ def render_time_series_plot(
 
   width_scale = min(w_in / 11.0, 1.15)
   ax.set_title(
-      final_title_ts,
+      title_str,
       fontsize=max(11.5, 13.5 * width_scale),
       fontweight="bold",
       pad=12,
@@ -1261,7 +1306,7 @@ def render_time_series_plot(
   handles, labels_ts = ax.get_legend_handles_labels()
   if w_in / h_in < 1.55:
     n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
-    leg = ax.legend(
+    ax.legend(
         handles[:20],
         labels_ts[:20],
         loc="upper center",
@@ -1288,36 +1333,37 @@ def render_time_series_plot(
 
 
 def render_excel_style_row_mean_plot(
-    w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
+    b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
 ):
-  """复刻经典 Excel 折线图风格的单行均值趋势图"""
   fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
   ax.set_facecolor("white")
+  df_c = b["df_clean"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
 
   if x_mode_opt == "保留原始表格行号 (Row Index)":
-    x_seq = df_clean["Row_Index"].to_numpy(dtype=int)
+    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
   else:
-    x_seq = np.arange(1, len(df_clean) + 1)
+    x_seq = np.arange(1, len(df_c) + 1)
 
-  y_mean_series = df_clean["_Row_Mean_"].to_numpy(dtype=float)
+  y_mean_series = df_c["_Row_Mean_"].to_numpy(dtype=float)
 
   ax.plot(
       x_seq,
-      np.full_like(x_seq, target, dtype=float),
+      np.full_like(x_seq, p_target, dtype=float),
       color="#4472C4",
       lw=2.5,
       label="目标值",
   )
   ax.plot(
       x_seq,
-      np.full_like(x_seq, usl, dtype=float),
+      np.full_like(x_seq, p_usl, dtype=float),
       color="#ED7D31",
       lw=2.5,
       label="规格上限",
   )
   ax.plot(
       x_seq,
-      np.full_like(x_seq, lsl, dtype=float),
+      np.full_like(x_seq, p_lsl, dtype=float),
       color="#A5A5A5",
       lw=2.5,
       label="规格下限",
@@ -1338,12 +1384,14 @@ def render_excel_style_row_mean_plot(
   ):
     ax.set_ylim(ymin_val, ymax_val)
   else:
-    spec_span = usl - lsl
+    spec_span = p_usl - p_lsl
     y_low = min(
-        lsl - 0.5 * spec_span, float(np.min(y_mean_series)) - 0.15 * spec_span
+        p_lsl - 0.5 * spec_span,
+        float(np.min(y_mean_series)) - 0.15 * spec_span,
     )
     y_high = max(
-        usl + 0.25 * spec_span, float(np.max(y_mean_series)) + 0.15 * spec_span
+        p_usl + 0.25 * spec_span,
+        float(np.max(y_mean_series)) + 0.15 * spec_span,
     )
     ax.set_ylim(y_low, y_high)
 
@@ -1374,7 +1422,7 @@ def render_excel_style_row_mean_plot(
 
   width_scale = min(w_in / 10.5, 1.15)
   ax.set_title(
-      final_title_mean,
+      title_str,
       fontsize=max(13.5, 16.5 * width_scale),
       fontweight="normal",
       color="#595959",
@@ -1399,154 +1447,248 @@ def render_excel_style_row_mean_plot(
   return save_fig_with_border(fig, use_tight=True)
 
 
-# ==================== 独立分标签页（每张图独立控制比例与交互选项） ====================
-tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
-    "1️⃣ 过程能力报告 (CPK)",
-    "2️⃣ 分组箱线图 (Box Plot)",
-    "3️⃣ 多通道时间序列图 (Time Series)",
-    "4️⃣ 单行均值趋势图 (Excel 风格)",
-    "5️⃣ 清洗后数据明细与导出",
-])
+# ==================== 多项目汇总表与一键打包 ZIP ====================
+summary_rows = []
+for p_name in ready_projects:
+  b = project_bundles[p_name]
+  summary_rows.append({
+      "项目组": p_name,
+      "通道数": len(b["cols"]),
+      "有效行数": len(b["df_clean"]),
+      "总样本 N": b["total_n"],
+      "屏蔽异常单点": b["masked_cells"],
+      "LSL": b["lsl"],
+      "Target": b["target"],
+      "USL": b["usl"],
+      "均值": round(b["sample_mean"], 4),
+      "组内σ": round(b["std_within"], 5),
+      "CPK": round(b["cpk"], 2),
+      "PPK": round(b["ppk"], 2),
+  })
+df_summary = pd.DataFrame(summary_rows)
+st.dataframe(df_summary, width="stretch", hide_index=True)
 
-safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", topic_clean)
-
-with tab_cap:
-  cc1, _ = st.columns([1.8, 3.2])
-  cap_w, cap_h, cap_px = render_aspect_selector(cc1, "cap", default_idx=0)
-  buf_cap = render_capability_plot(cap_w, cap_h)
-  st.image(buf_cap, width=cap_px)
-  buf_cap.seek(0)
+if len(ready_projects) > 1:
+  zip_buf = io.BytesIO()
+  with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for p_name in ready_projects:
+      b = project_bundles[p_name]
+      t_cap, t_box, t_ts, t_mean = get_project_titles(p_name)
+      safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
+      zf.writestr(
+          f"{safe_p}/{safe_p}_CPK.png",
+          render_capability_plot(b, t_cap, 9.6, 7.2).getvalue(),
+      )
+      zf.writestr(
+          f"{safe_p}/{safe_p}_BoxPlot.png",
+          render_box_plot(b, t_box, 9.6, 7.2).getvalue(),
+      )
+      zf.writestr(
+          f"{safe_p}/{safe_p}_TimeSeries.png",
+          render_time_series_plot(
+              b, t_ts, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
+          ).getvalue(),
+      )
+      zf.writestr(
+          f"{safe_p}/{safe_p}_RowMean_Trend.png",
+          render_excel_style_row_mean_plot(
+              b, t_mean, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
+          ).getvalue(),
+      )
+  zip_buf.seek(0)
+  safe_sheet = re.sub(r'[\\/*?:"<>|]', "_", selected_sheet)
   st.download_button(
-      "🖼️ 下载当前过程能力报告图 (.png)",
-      data=buf_cap,
-      file_name=f"{safe_prefix}_CPK.png",
-      mime="image/png",
+      f"📦 一键打包下载全部 {len(ready_projects)} 个项目图表 (.zip)",
+      data=zip_buf,
+      file_name=f"{safe_sheet}_多项目SPC图表包.zip",
+      mime="application/zip",
   )
 
-with tab_box:
-  bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 1.2, 1.3, 0.9, 1.6])
-  show_box_median = bc1.checkbox("显示中位数 (Median)", value=True)
-  show_box_mean = bc2.checkbox("显示均值 (Mean)", value=False)
-  show_box_outliers = bc3.checkbox("显示异常点 (Outliers)", value=False)
-  box_decimals = bc4.selectbox(
-      "小数位", options=[2, 3, 4, 5, 6], index=2
-  )
-  box_w, box_h, box_px = render_aspect_selector(bc5, "box", default_idx=0)
+# ==================== 按项目分标签页展示全套图表与导出 ====================
+proj_tabs = st.tabs([f"📊 {p_name}" for p_name in ready_projects])
 
-  buf_box = render_box_plot(
-      box_w,
-      box_h,
-      show_outliers=show_box_outliers,
-      show_median_val=show_box_median,
-      show_mean_val=show_box_mean,
-      decimals=box_decimals,
-  )
-  st.image(buf_box, width=box_px)
-  buf_box.seek(0)
-  st.download_button(
-      "🖼️ 下载当前箱线图 (.png)",
-      data=buf_box,
-      file_name=f"{safe_prefix}_BoxPlot.png",
-      mime="image/png",
-  )
+for p_tab, p_name in zip(proj_tabs, ready_projects):
+  with p_tab:
+    b = project_bundles[p_name]
+    t_cap, t_box, t_ts, t_mean = get_project_titles(p_name)
+    safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", p_name)
+    all_v = b["all_valid_vals"]
+    p_lsl, p_usl = b["lsl"], b["usl"]
 
-with tab_ts:
-  tc1, tc2, tc3, tc4, tc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
-  ts_x_mode = tc1.selectbox(
-      "X轴序号",
-      options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
-      index=0,
-      key="ts_x_mode",
-  )
-  ts_y_mode = tc2.selectbox(
-      "Y轴尺度",
-      options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
-      index=0,
-      key="ts_y_mode",
-  )
-  default_ymin = float(np.min(all_valid_vals))
-  default_ymax = float(np.max(all_valid_vals))
-  pad = max((default_ymax - default_ymin) * 0.1, 0.02)
+    tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
+        "1️⃣ 过程能力报告 (CPK)",
+        "2️⃣ 分组箱线图 (Box Plot)",
+        "3️⃣ 多通道时间序列图 (Time Series)",
+        "4️⃣ 单行均值趋势图 (Excel 风格)",
+        "5️⃣ 清洗后数据明细与导出",
+    ])
 
-  ts_ymin, ts_ymax = None, None
-  if ts_y_mode == "自定义范围 (Manual)":
-    ts_ymin = tc3.number_input(
-        "Y-Min", value=round(default_ymin - pad, 4), format="%.4f", key="ts_ymin"
-    )
-    ts_ymax = tc4.number_input(
-        "Y-Max", value=round(default_ymax + pad, 4), format="%.4f", key="ts_ymax"
-    )
-  ts_w, ts_h, ts_px = render_aspect_selector(tc5, "ts", default_idx=3)
+    with tab_cap:
+      cc1, _ = st.columns([1.8, 3.2])
+      cap_w, cap_h, cap_px = render_aspect_selector(
+          cc1, f"cap_{p_name}", default_idx=0
+      )
+      buf_cap = render_capability_plot(b, t_cap, cap_w, cap_h)
+      st.image(buf_cap, width=cap_px)
+      buf_cap.seek(0)
+      st.download_button(
+          f"🖼️ 下载 [{p_name}] 过程能力报告图 (.png)",
+          data=buf_cap,
+          file_name=f"{safe_prefix}_CPK.png",
+          mime="image/png",
+          key=f"dl_cap_{p_name}",
+      )
 
-  buf_ts = render_time_series_plot(
-      ts_w, ts_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
-  )
-  st.image(buf_ts, width=ts_px)
-  buf_ts.seek(0)
-  st.download_button(
-      "🖼️ 下载当前多通道时间序列图 (.png)",
-      data=buf_ts,
-      file_name=f"{safe_prefix}_TimeSeries.png",
-      mime="image/png",
-  )
+    with tab_box:
+      bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 1.2, 1.3, 0.9, 1.6])
+      show_box_median = bc1.checkbox(
+          "显示中位数 (Median)", value=True, key=f"bmed_{p_name}"
+      )
+      show_box_mean = bc2.checkbox(
+          "显示均值 (Mean)", value=False, key=f"bmean_{p_name}"
+      )
+      show_box_outliers = bc3.checkbox(
+          "显示异常点 (Outliers)", value=False, key=f"bout_{p_name}"
+      )
+      box_decimals = bc4.selectbox(
+          "小数位", options=[2, 3, 4, 5, 6], index=2, key=f"bdec_{p_name}"
+      )
+      box_w, box_h, box_px = render_aspect_selector(
+          bc5, f"box_{p_name}", default_idx=0
+      )
 
-with tab_mean:
-  mc1, mc2, mc3, mc4, mc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
-  mean_x_mode = mc1.selectbox(
-      "X轴序号",
-      options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
-      index=0,
-      key="mean_x_mode",
-  )
-  mean_y_mode = mc2.selectbox(
-      "Y轴尺度",
-      options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
-      index=0,
-      key="mean_y_mode",
-  )
-  mean_ymin, mean_ymax = None, None
-  if mean_y_mode == "自定义范围 (Manual)":
-    spec_span = usl - lsl
-    mean_ymin = mc3.number_input(
-        "Y-Min",
-        value=round(lsl - 0.5 * spec_span, 4),
-        format="%.4f",
-        key="mean_ymin",
-    )
-    mean_ymax = mc4.number_input(
-        "Y-Max",
-        value=round(usl + 0.25 * spec_span, 4),
-        format="%.4f",
-        key="mean_ymax",
-    )
-  mean_w, mean_h, mean_px = render_aspect_selector(mc5, "mean", default_idx=3)
+      buf_box = render_box_plot(
+          b,
+          t_box,
+          box_w,
+          box_h,
+          show_outliers=show_box_outliers,
+          show_median_val=show_box_median,
+          show_mean_val=show_box_mean,
+          decimals=box_decimals,
+      )
+      st.image(buf_box, width=box_px)
+      buf_box.seek(0)
+      st.download_button(
+          f"🖼️ 下载 [{p_name}] 箱线图 (.png)",
+          data=buf_box,
+          file_name=f"{safe_prefix}_BoxPlot.png",
+          mime="image/png",
+          key=f"dl_box_{p_name}",
+      )
 
-  buf_mean = render_excel_style_row_mean_plot(
-      mean_w, mean_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
-  )
-  st.image(buf_mean, width=mean_px)
-  buf_mean.seek(0)
-  st.download_button(
-      "🖼️ 下载当前单行均值趋势图 (.png)",
-      data=buf_mean,
-      file_name=f"{safe_prefix}_RowMean_Trend.png",
-      mime="image/png",
-  )
+    with tab_ts:
+      tc1, tc2, tc3, tc4, tc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
+      ts_x_mode = tc1.selectbox(
+          "X轴序号",
+          options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
+          index=0,
+          key=f"ts_x_{p_name}",
+      )
+      ts_y_mode = tc2.selectbox(
+          "Y轴尺度",
+          options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
+          index=0,
+          key=f"ts_y_{p_name}",
+      )
+      d_ymin, d_ymax = float(np.min(all_v)), float(np.max(all_v))
+      pad = max((d_ymax - d_ymin) * 0.1, 0.02)
+      ts_ymin, ts_ymax = None, None
+      if ts_y_mode == "自定义范围 (Manual)":
+        ts_ymin = tc3.number_input(
+            "Y-Min",
+            value=round(d_ymin - pad, 4),
+            format="%.4f",
+            key=f"ts_ymin_{p_name}",
+        )
+        ts_ymax = tc4.number_input(
+            "Y-Max",
+            value=round(d_ymax + pad, 4),
+            format="%.4f",
+            key=f"ts_ymax_{p_name}",
+        )
+      ts_w, ts_h, ts_px = render_aspect_selector(
+          tc5, f"ts_{p_name}", default_idx=3
+      )
 
-with tab_data:
-  excel_buf = io.BytesIO()
-  with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-    df_clean.to_excel(writer, sheet_name="Valid_Data", index=False)
-    df_removed.to_excel(writer, sheet_name="Filtered_Out_Rows", index=False)
-  excel_buf.seek(0)
-  st.download_button(
-      "📥 导出有效数据与被屏蔽异常行 (.xlsx)",
-      data=excel_buf,
-      file_name=f"{safe_prefix}_Filtered.xlsx",
-      mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  )
-  sub_t1, sub_t2 = st.tabs(["有效数据 (Valid)", "被屏蔽异常行 (Filtered Out)"])
-  with sub_t1:
-    st.dataframe(df_clean, width="stretch")
-  with sub_t2:
-    st.dataframe(df_removed, width="stretch")
+      buf_ts = render_time_series_plot(
+          b, t_ts, ts_w, ts_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
+      )
+      st.image(buf_ts, width=ts_px)
+      buf_ts.seek(0)
+      st.download_button(
+          f"🖼️ 下载 [{p_name}] 多通道时间序列图 (.png)",
+          data=buf_ts,
+          file_name=f"{safe_prefix}_TimeSeries.png",
+          mime="image/png",
+          key=f"dl_ts_{p_name}",
+      )
+
+    with tab_mean:
+      mc1, mc2, mc3, mc4, mc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
+      mean_x_mode = mc1.selectbox(
+          "X轴序号",
+          options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
+          index=0,
+          key=f"mean_x_{p_name}",
+      )
+      mean_y_mode = mc2.selectbox(
+          "Y轴尺度",
+          options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
+          index=0,
+          key=f"mean_y_{p_name}",
+      )
+      mean_ymin, mean_ymax = None, None
+      if mean_y_mode == "自定义范围 (Manual)":
+        spec_span = p_usl - p_lsl
+        mean_ymin = mc3.number_input(
+            "Y-Min",
+            value=round(p_lsl - 0.5 * spec_span, 4),
+            format="%.4f",
+            key=f"mean_ymin_{p_name}",
+        )
+        mean_ymax = mc4.number_input(
+            "Y-Max",
+            value=round(p_usl + 0.25 * spec_span, 4),
+            format="%.4f",
+            key=f"mean_ymax_{p_name}",
+        )
+      mean_w, mean_h, mean_px = render_aspect_selector(
+          mc5, f"mean_{p_name}", default_idx=3
+      )
+
+      buf_mean = render_excel_style_row_mean_plot(
+          b, t_mean, mean_w, mean_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
+      )
+      st.image(buf_mean, width=mean_px)
+      buf_mean.seek(0)
+      st.download_button(
+          f"🖼️ 下载 [{p_name}] 单行均值趋势图 (.png)",
+          data=buf_mean,
+          file_name=f"{safe_prefix}_RowMean_Trend.png",
+          mime="image/png",
+          key=f"dl_mean_{p_name}",
+      )
+
+    with tab_data:
+      excel_buf = io.BytesIO()
+      with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+        b["df_clean"].to_excel(writer, sheet_name="Valid_Data", index=False)
+        b["df_removed"].to_excel(
+            writer, sheet_name="Filtered_Out_Rows", index=False
+        )
+      excel_buf.seek(0)
+      st.download_button(
+          f"📥 导出 [{p_name}] 有效数据与被屏蔽异常行 (.xlsx)",
+          data=excel_buf,
+          file_name=f"{safe_prefix}_Filtered.xlsx",
+          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          key=f"dl_xlsx_{p_name}",
+      )
+      sub_t1, sub_t2 = st.tabs(
+          ["有效数据 (Valid)", "被屏蔽异常行 (Filtered Out)"]
+      )
+      with sub_t1:
+        st.dataframe(b["df_clean"], width="stretch")
+      with sub_t2:
+        st.dataframe(b["df_removed"], width="stretch")
