@@ -239,7 +239,7 @@ if not measurement_candidates:
 
 
 def is_likely_non_measurement(name_str):
-  """识别常见非质量检测数值列（日期、时间、编号、EA号、速度、走带距离等）"""
+  """识别常见非质量检测数值列（日期、时间、编号、EA号、速度、走带距离、OK/NG统计等）"""
   s = str(name_str).strip().lower()
   non_meas_tokens = [
       "日期",
@@ -263,6 +263,8 @@ def is_likely_non_measurement(name_str):
       "米数",
       "meter",
       "len",
+      "ok(",
+      "ng(",
   ]
   return any(tok in s for tok in non_meas_tokens)
 
@@ -296,7 +298,10 @@ if st.session_state.get("active_dataset_key") != dataset_key:
   }
   st.session_state["draft_projects"] = list(suggested_default_groups)
   st.session_state["confirmed_projects"] = list(suggested_default_groups)
-  st.session_state["charts_generated"] = True
+  st.session_state["confirmed_groups_snapshot"] = {
+      k: list(v) for k, v in inferred_groups.items()
+  }
+  st.session_state["selection_dirty"] = False
   st.session_state["project_specs_map"] = {}
 
 proj_map = st.session_state.setdefault(
@@ -315,10 +320,11 @@ selected_projects = st.sidebar.multiselect(
     options=available_proj_names,
     default=draft_default,
     key=f"ms_draft_projects_{dataset_key}",
-    help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新图表」，避免非检测列拖慢操作。",
+    help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新图表」，避免误选列拖慢操作。",
 )
 st.session_state["draft_projects"] = selected_projects
 
+cols_changed_in_expander = False
 with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=False):
   for p_name in available_proj_names:
     updated_cols = st.multiselect(
@@ -327,8 +333,9 @@ with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=Fals
         default=[c for c in proj_map[p_name] if c in numeric_cols_all],
         key=f"cols_for_{dataset_key}_{p_name}",
     )
-    if updated_cols:
+    if updated_cols and updated_cols != proj_map[p_name]:
       proj_map[p_name] = updated_cols
+      cols_changed_in_expander = True
 
   new_grp_name = st.text_input(
       "新增自定义项目组名称",
@@ -352,7 +359,25 @@ with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=Fals
       proj_map[g_clean] = list(new_grp_cols)
       if g_clean not in st.session_state["draft_projects"]:
         st.session_state["draft_projects"].append(g_clean)
+      st.session_state["selection_dirty"] = True
       st.rerun()
+
+# 若用户修改了多选项目或通道列，立即标记为待确认，暂停图表自动重绘
+prev_confirmed = st.session_state.get("confirmed_projects", [])
+prev_snapshot = st.session_state.get("confirmed_groups_snapshot", {})
+current_selected_non_empty = [
+    p for p in selected_projects if len(proj_map.get(p, [])) > 0
+]
+current_snapshot = {
+    p: list(proj_map.get(p, [])) for p in current_selected_non_empty
+}
+
+if (
+    current_selected_non_empty != prev_confirmed
+    or current_snapshot != prev_snapshot
+    or cols_changed_in_expander
+):
+  st.session_state["selection_dirty"] = True
 
 generate_clicked = st.sidebar.button(
     "🚀 生成 / 更新所选项目图表",
@@ -361,10 +386,23 @@ generate_clicked = st.sidebar.button(
     use_container_width=True,
 )
 if generate_clicked:
-  st.session_state["confirmed_projects"] = [
-      p for p in selected_projects if len(proj_map.get(p, [])) > 0
-  ]
-  st.session_state["charts_generated"] = True
+  st.session_state["confirmed_projects"] = list(current_selected_non_empty)
+  st.session_state["confirmed_groups_snapshot"] = {
+      p: list(proj_map.get(p, [])) for p in current_selected_non_empty
+  }
+  st.session_state["selection_dirty"] = False
+
+if st.session_state.get("selection_dirty", False):
+  st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+  if not current_selected_non_empty:
+    st.info(
+        "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目（或展开**「调整各项目包含的通道列」**），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+    )
+  else:
+    st.warning(
+        f"👈 检测到项目或通道列选择已变更（当前已选 {len(current_selected_non_empty)} 个项目：{', '.join(current_selected_non_empty)}）。已暂停自动出图，请点击左侧 **「🚀 生成 / 更新所选项目图表」** 开始生成。"
+    )
+  st.stop()
 
 confirmed_projects = [
     p
@@ -372,10 +410,10 @@ confirmed_projects = [
     if p in available_proj_names and len(proj_map.get(p, [])) > 0
 ]
 
-if not st.session_state.get("charts_generated", False) or not confirmed_projects:
+if not confirmed_projects:
   st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
   st.info(
-      "👈 请先在左侧确认**待生成项目**及**各项目通道列**（已自动过滤日期、编号、走带等非检测列），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+      "👈 请在左侧**「待生成项目 / 参数组」**中选择至少一个项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
   )
   st.stop()
 
@@ -967,43 +1005,54 @@ def get_project_titles(p_name):
 def save_fig_with_border(fig, use_tight=False):
   fig.patch.set_facecolor("white")
   buf = io.BytesIO()
-  if use_tight:
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    bbox_in = fig.get_tightbbox(renderer)
-    pad_in = 0.14
-    fig_w_in, fig_h_in = fig.get_size_inches()
-    if show_outer_border and bbox_in is not None:
-      x0 = (bbox_in.x0 - pad_in) / fig_w_in
-      y0 = (bbox_in.y0 - pad_in) / fig_h_in
-      w_norm = (bbox_in.width + 2 * pad_in) / fig_w_in
-      h_norm = (bbox_in.height + 2 * pad_in) / fig_h_in
-      border_rect = Rectangle(
-          (x0, y0),
-          w_norm,
-          h_norm,
-          transform=fig.transFigure,
-          fill=False,
-          edgecolor="#A6A6A6",
-          linewidth=1.2,
-          zorder=100,
-          clip_on=False,
+  try:
+    if use_tight:
+      fig.canvas.draw()
+      renderer = getattr(fig.canvas, "get_renderer", lambda: None)()
+      fig_w_in, fig_h_in = fig.get_size_inches()
+      pad_in = 0.14
+      if show_outer_border and renderer is not None:
+        bbox_in = fig.get_tightbbox(renderer)
+        if (
+            bbox_in is not None
+            and bbox_in.width > 0
+            and bbox_in.height > 0
+            and fig_w_in > 0
+            and fig_h_in > 0
+        ):
+          x0 = (bbox_in.x0 - pad_in) / fig_w_in
+          y0 = (bbox_in.y0 - pad_in) / fig_h_in
+          w_norm = (bbox_in.width + 2 * pad_in) / fig_w_in
+          h_norm = (bbox_in.height + 2 * pad_in) / fig_h_in
+          border_rect = Rectangle(
+              (x0, y0),
+              w_norm,
+              h_norm,
+              transform=fig.transFigure,
+              fill=False,
+              edgecolor="#A6A6A6",
+              linewidth=1.2,
+              zorder=100,
+              clip_on=False,
+          )
+          fig.patches.append(border_rect)
+      fig.savefig(
+          buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in
       )
-      fig.patches.append(border_rect)
-    fig.savefig(
-        buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in
-    )
-  else:
-    if show_outer_border:
-      fig.patch.set_edgecolor("#A6A6A6")
-      fig.patch.set_linewidth(2.2)
-    fig.savefig(
-        buf,
-        format="png",
-        dpi=170,
-        facecolor=fig.get_facecolor(),
-        edgecolor=fig.get_edgecolor(),
-    )
+    else:
+      if show_outer_border:
+        fig.patch.set_edgecolor("#A6A6A6")
+        fig.patch.set_linewidth(2.2)
+      fig.savefig(
+          buf,
+          format="png",
+          dpi=170,
+          facecolor=fig.get_facecolor(),
+          edgecolor=fig.get_edgecolor(),
+      )
+  except Exception:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
   buf.seek(0)
   plt.close(fig)
   return buf
@@ -1101,13 +1150,16 @@ def render_capability_plot(b, title_str, w_in, h_in):
       alpha=0.92,
   )
 
-  span = p_usl - p_lsl
+  span = max(p_usl - p_lsl, 1e-6)
   x_min_c = min(p_lsl - 0.18 * span, float(np.min(all_v)) - 0.08 * span)
   x_max_c = max(p_usl + 0.18 * span, float(np.max(all_v)) + 0.08 * span)
+  if abs(x_max_c - x_min_c) < 1e-9:
+    x_min_c -= 1.0
+    x_max_c += 1.0
   x_grid = np.linspace(x_min_c, x_max_c, 500)
 
   line_ov, line_wi = None, None
-  if s_ov > 0:
+  if s_ov > 1e-12:
     (line_ov,) = ax_mid.plot(
         x_grid,
         stats.norm.pdf(x_grid, s_mean, s_ov),
@@ -1116,7 +1168,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
         ls="-",
         label="Overall",
     )
-  if s_wi > 0:
+  if s_wi > 1e-12:
     (line_wi,) = ax_mid.plot(
         x_grid,
         stats.norm.pdf(x_grid, s_mean, s_wi),
@@ -1132,7 +1184,10 @@ def render_capability_plot(b, title_str, w_in, h_in):
 
   y_peak = max(
       float(np.max(counts)) if len(counts) else 1.0,
-      float(np.max(stats.norm.pdf(x_grid, s_mean, s_wi))) if s_wi > 0 else 1.0,
+      float(np.max(stats.norm.pdf(x_grid, s_mean, s_wi)))
+      if s_wi > 1e-12
+      else 1.0,
+      1e-6,
   )
   ax_mid.set_ylim(0, y_peak * 1.14)
   ax_mid.set_yticks([])
@@ -1284,7 +1339,10 @@ def render_box_plot(
   p_cols = b["cols"]
   p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
 
-  box_data = [df_c[c].dropna().to_numpy(dtype=float) for c in p_cols]
+  box_data = [
+      arr if len(arr) > 0 else np.array([p_target], dtype=float)
+      for arr in (df_c[c].dropna().to_numpy(dtype=float) for c in p_cols)
+  ]
   box_labels = [str(c) for c in p_cols]
   n_boxes = len(box_data)
   box_width = 0.42 if n_boxes <= 15 else 0.36
@@ -1319,9 +1377,7 @@ def render_box_plot(
   fmt_str = f"{{:.{decimals}f}}"
 
   if show_mean_val:
-    means_arr = [
-        float(np.mean(arr)) if len(arr) > 0 else np.nan for arr in box_data
-    ]
+    means_arr = [float(np.mean(arr)) for arr in box_data]
     ax.scatter(
         np.arange(1, n_boxes + 1),
         means_arr,
@@ -1336,8 +1392,6 @@ def render_box_plot(
   y_span_cur = max(y_max_cur - y_min_cur, 1e-6)
 
   for idx, arr in enumerate(box_data):
-    if len(arr) == 0:
-      continue
     x_pos = (idx + 1) + x_offset
     med_v = float(np.median(arr))
     mean_v = float(np.mean(arr))
@@ -1567,7 +1621,7 @@ def render_excel_style_row_mean_plot(
   ):
     ax.set_ylim(ymin_val, ymax_val)
   else:
-    spec_span = p_usl - p_lsl
+    spec_span = max(p_usl - p_lsl, 1e-6)
     y_low = min(
         p_lsl - 0.5 * spec_span,
         float(np.min(y_mean_series)) - 0.15 * spec_span,
@@ -1576,9 +1630,13 @@ def render_excel_style_row_mean_plot(
         p_usl + 0.25 * spec_span,
         float(np.max(y_mean_series)) + 0.15 * spec_span,
     )
+    if abs(y_high - y_low) < 1e-9:
+      y_low -= 1.0
+      y_high += 1.0
     ax.set_ylim(y_low, y_high)
 
-  ax.set_xlim(x_seq[0], x_seq[-1])
+  if len(x_seq) >= 2 and x_seq[-1] > x_seq[0]:
+    ax.set_xlim(x_seq[0], x_seq[-1])
 
   if len(x_seq) > 1:
     n_ticks = max(12, int(w_in * 2.1))
