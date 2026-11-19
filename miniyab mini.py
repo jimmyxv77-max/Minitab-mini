@@ -506,7 +506,7 @@ exp_wi_gt_usl = (
 )
 exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
 
-# ==================== 右侧主工作区：顶部概览与紧凑控制条 ====================
+# ==================== 右侧主工作区：顶部概览与紧凑标题栏 ====================
 st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
 
 m1, m2, m3, m4 = st.columns(4)
@@ -515,66 +515,34 @@ m2.metric("有效分析行数", len(df_clean))
 m3.metric("已全局屏蔽行数", len(df_removed))
 m4.metric("总样本数 N", len(all_valid_vals))
 
-ctrl_col1, ctrl_col2 = st.columns(2)
-
-with ctrl_col1:
-  with st.expander("📐 图像比例与尺寸（适配 PPT 多图排版）", expanded=True):
-    aspect_preset = st.selectbox(
-        "选择图像宽高比预设",
-        options=[
-            "4 : 3（PPT 四宫格/并排标准推荐）",
-            "3 : 2（紧凑双图对比）",
-            "16 : 9（单图宽屏展示）",
-            "2.2 : 1（超宽横幅）",
-            "自定义宽高比",
-        ],
-        index=0,
-    )
-    if aspect_preset == "4 : 3（PPT 四宫格/并排标准推荐）":
-      fig_w, fig_h = 9.6, 7.2
-    elif aspect_preset == "3 : 2（紧凑双图对比）":
-      fig_w, fig_h = 10.5, 7.0
-    elif aspect_preset == "16 : 9（单图宽屏展示）":
-      fig_w, fig_h = 12.8, 7.2
-    elif aspect_preset == "2.2 : 1（超宽横幅）":
-      fig_w, fig_h = 13.6, 6.2
-    else:
-      ac1, ac2 = st.columns(2)
-      ratio_w = ac1.number_input("宽度比例", min_value=1.0, max_value=30.0, value=4.0, step=0.5)
-      ratio_h = ac2.number_input("高度比例", min_value=1.0, max_value=30.0, value=3.0, step=0.5)
-      base_h = 7.0
-      fig_w = float(np.clip(base_h * (ratio_w / ratio_h), 6.5, 16.0))
-      fig_h = base_h
-
-with ctrl_col2:
-  with st.expander("✏️ 自定义项目名称与各图表主标题", expanded=False):
-    base_topic_name = st.text_input(
-        "项目 / 检测参数名称（自动同步至各图）",
-        value=selected_sheet,
-        placeholder="例如: Coating density of single side",
-    )
-    tc_a, tc_b = st.columns(2)
-    custom_title_cap = tc_a.text_input(
-        "能力报告标题（留空自动生成）",
-        value="",
-        placeholder=f"{base_topic_name} — Process Capability Report",
-    )
-    custom_title_box = tc_b.text_input(
-        "箱线图标题（留空自动生成）",
-        value="",
-        placeholder=f"{base_topic_name} — Box Plot",
-    )
-    tc_c, tc_d = st.columns(2)
-    custom_title_ts = tc_c.text_input(
-        "时间序列图标题（留空自动生成）",
-        value="",
-        placeholder=f"{base_topic_name} — Time Series Plot",
-    )
-    custom_title_mean = tc_d.text_input(
-        "单行均值图标题（留空自动生成）",
-        value="",
-        placeholder=f"{base_topic_name}均值",
-    )
+with st.expander("✏️ 自定义项目名称与各图表主标题（点击展开）", expanded=False):
+  t_col0, t_col1, t_col2 = st.columns(3)
+  base_topic_name = t_col0.text_input(
+      "项目 / 检测参数名称（自动同步至各图）",
+      value=selected_sheet,
+      placeholder="例如: Coating density of single side",
+  )
+  custom_title_cap = t_col1.text_input(
+      "能力报告标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name} — Process Capability Report",
+  )
+  custom_title_box = t_col2.text_input(
+      "箱线图标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name} — Box Plot",
+  )
+  t_col3, t_col4 = st.columns(2)
+  custom_title_ts = t_col3.text_input(
+      "时间序列图标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name} — Time Series Plot",
+  )
+  custom_title_mean = t_col4.text_input(
+      "单行均值图标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name}均值",
+  )
 
 topic_clean = (
     base_topic_name.strip() if base_topic_name.strip() else selected_sheet
@@ -601,18 +569,66 @@ final_title_mean = (
 )
 
 
+# ==================== 独立图表比例选择器组件 ====================
+ASPECT_OPTIONS = [
+    "4 : 3（PPT 多图/四宫格）",
+    "3 : 2（紧凑双图对比）",
+    "16 : 9（宽屏展示）",
+    "2.2 : 1（超宽横幅）",
+    "自定义比例",
+]
+
+
+def render_aspect_selector(container_col, key_prefix, default_idx=0):
+  """为单张图表渲染独立的比例选择器，返回 (fig_w, fig_h, preview_px_width)"""
+  preset = container_col.selectbox(
+      "图像比例",
+      options=ASPECT_OPTIONS,
+      index=default_idx,
+      key=f"{key_prefix}_aspect_preset",
+  )
+  if preset == "4 : 3（PPT 多图/四宫格）":
+    fw, fh = 9.6, 7.2
+  elif preset == "3 : 2（紧凑双图对比）":
+    fw, fh = 10.5, 7.0
+  elif preset == "16 : 9（宽屏展示）":
+    fw, fh = 12.8, 7.2
+  elif preset == "2.2 : 1（超宽横幅）":
+    fw, fh = 13.6, 6.2
+  else:
+    sub_c1, sub_c2 = container_col.columns(2)
+    rw = sub_c1.number_input(
+        "宽比",
+        min_value=1.0,
+        max_value=30.0,
+        value=4.0,
+        step=0.5,
+        key=f"{key_prefix}_rw",
+    )
+    rh = sub_c2.number_input(
+        "高比",
+        min_value=1.0,
+        max_value=30.0,
+        value=3.0,
+        step=0.5,
+        key=f"{key_prefix}_rh",
+    )
+    fh = 7.0
+    fw = float(np.clip(fh * (rw / rh), 6.5, 16.0))
+
+  px_w = int(min(1150, max(620, fw * 85)))
+  return fw, fh, px_w
+
+
 # ==================== 图表渲染函数（自适应画布比例） ====================
 def render_capability_plot(w_in, h_in):
-  """紧凑型 Minitab 风格过程能力报告：左右信息紧贴直方图，PPM 性能表位于直方图正下方，完美兼容 4:3 等任意 PPT 比例"""
   fig = plt.figure(figsize=(w_in, h_in), dpi=170)
   fig.patch.set_facecolor("white")
 
-  # 根据画布宽度自适应微调字号与比例
   scale_f = min(w_in / 9.6, h_in / 7.2)
   font_panel = max(7.2, 8.3 * scale_f)
   font_title = max(11.5, 13.5 * scale_f)
 
-  # 2行3列网格：上行 [左过程数据 | 中直方图 | 右能力指数]，下行 [空 | 底部PPM性能表 | 右图例]
   gs = fig.add_gridspec(
       2,
       3,
@@ -632,7 +648,6 @@ def render_capability_plot(w_in, h_in):
   for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
     ax_tmp.axis("off")
 
-  # --- 中间直方图与正态拟合曲线 ---
   bins_count = min(38, max(14, int(np.sqrt(total_n) * 0.55)))
   counts, _, _ = ax_mid.hist(
       all_valid_vals,
@@ -687,7 +702,6 @@ def render_capability_plot(w_in, h_in):
     ax_mid.spines[sp].set_color("#CBD5E1")
     ax_mid.spines[sp].set_linewidth(0.8)
 
-  # 顶部规格线标签（紧凑贴合顶框）
   lbl_sz = max(7.5, 8.5 * scale_f)
   ax_mid.text(
       lsl,
@@ -719,7 +733,6 @@ def render_capability_plot(w_in, h_in):
       fontsize=lbl_sz,
   )
 
-  # --- 左侧：过程数据（紧贴直方图左侧，无冗余大框） ---
   left_text = (
       f"Process Data\n"
       f"----------------------\n"
@@ -745,7 +758,6 @@ def render_capability_plot(w_in, h_in):
       color="#1E293B",
   )
 
-  # --- 右侧：整体能力 & 潜在能力（紧贴直方图右侧） ---
   right_text = (
       f"Overall Capability\n"
       f"------------------\n"
@@ -772,7 +784,6 @@ def render_capability_plot(w_in, h_in):
       color="#1E293B",
   )
 
-  # --- 右下角：Overall / Within 曲线图例（不遮挡直方图内部） ---
   handles_leg = [h for h in (line_ov, line_wi) if h is not None]
   if handles_leg:
     ax_bot_right.legend(
@@ -785,7 +796,6 @@ def render_capability_plot(w_in, h_in):
         edgecolor="#CBD5E1",
     )
 
-  # --- 底部正中：Performance (PPM) 表（对齐直方图正下方，复刻 Minitab 原版） ---
   ppm_text = (
       f"Performance (PPM)        Observed    Exp. Overall    Exp. Within\n"
       f"----------------------------------------------------------------\n"
@@ -1038,7 +1048,6 @@ def render_time_series_plot(
   ax.grid(True, ls=":", alpha=0.45)
 
   handles, labels_ts = ax.get_legend_handles_labels()
-  # 偏窄比例时（如 4:3）图例自动放到底部多列排布，避免挤压主图宽度
   if w_in / h_in < 1.55:
     n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
     leg = ax.legend(
@@ -1190,7 +1199,7 @@ def render_excel_style_row_mean_plot(
   return buf
 
 
-# ==================== 独立分标签页（按真实比例预览与导出） ====================
+# ==================== 独立分标签页（每张图独立控制比例与交互选项） ====================
 tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
     "1️⃣ 过程能力报告 (CPK)",
     "2️⃣ 分组箱线图 (Box Plot)",
@@ -1200,11 +1209,12 @@ tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
 ])
 
 safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", topic_clean)
-preview_px_width = int(min(1050, max(620, fig_w * 85)))
 
 with tab_cap:
-  buf_cap = render_capability_plot(fig_w, fig_h)
-  st.image(buf_cap, width=preview_px_width)
+  cc1, _ = st.columns([1.8, 3.2])
+  cap_w, cap_h, cap_px = render_aspect_selector(cc1, "cap", default_idx=0)
+  buf_cap = render_capability_plot(cap_w, cap_h)
+  st.image(buf_cap, width=cap_px)
   buf_cap.seek(0)
   st.download_button(
       "🖼️ 下载当前过程能力报告图 (.png)",
@@ -1214,23 +1224,24 @@ with tab_cap:
   )
 
 with tab_box:
-  bc1, bc2, bc3, bc4 = st.columns([1.3, 1.3, 1.4, 1.2])
-  show_box_median = bc1.checkbox("显示中位数数值 (Median)", value=True)
-  show_box_mean = bc2.checkbox("显示均值数值 (Mean)", value=False)
+  bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 1.2, 1.3, 0.9, 1.6])
+  show_box_median = bc1.checkbox("显示中位数 (Median)", value=True)
+  show_box_mean = bc2.checkbox("显示均值 (Mean)", value=False)
   show_box_outliers = bc3.checkbox("显示异常点 (Outliers)", value=False)
   box_decimals = bc4.selectbox(
-      "数值小数位", options=[2, 3, 4, 5, 6], index=2, label_visibility="collapsed"
+      "小数位", options=[2, 3, 4, 5, 6], index=2
   )
+  box_w, box_h, box_px = render_aspect_selector(bc5, "box", default_idx=0)
 
   buf_box = render_box_plot(
-      fig_w,
-      fig_h,
+      box_w,
+      box_h,
       show_outliers=show_box_outliers,
       show_median_val=show_box_median,
       show_mean_val=show_box_mean,
       decimals=box_decimals,
   )
-  st.image(buf_box, width=preview_px_width)
+  st.image(buf_box, width=box_px)
   buf_box.seek(0)
   st.download_button(
       "🖼️ 下载当前箱线图 (.png)",
@@ -1240,7 +1251,7 @@ with tab_box:
   )
 
 with tab_ts:
-  tc1, tc2, tc3, tc4 = st.columns([1.8, 1.5, 1.0, 1.0])
+  tc1, tc2, tc3, tc4, tc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
   ts_x_mode = tc1.selectbox(
       "X轴序号",
       options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
@@ -1265,11 +1276,12 @@ with tab_ts:
     ts_ymax = tc4.number_input(
         "Y-Max", value=round(default_ymax + pad, 4), format="%.4f", key="ts_ymax"
     )
+  ts_w, ts_h, ts_px = render_aspect_selector(tc5, "ts", default_idx=3)
 
   buf_ts = render_time_series_plot(
-      fig_w, fig_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
+      ts_w, ts_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
   )
-  st.image(buf_ts, width=preview_px_width)
+  st.image(buf_ts, width=ts_px)
   buf_ts.seek(0)
   st.download_button(
       "🖼️ 下载当前多通道时间序列图 (.png)",
@@ -1279,7 +1291,7 @@ with tab_ts:
   )
 
 with tab_mean:
-  mc1, mc2, mc3, mc4 = st.columns([1.8, 1.5, 1.0, 1.0])
+  mc1, mc2, mc3, mc4, mc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
   mean_x_mode = mc1.selectbox(
       "X轴序号",
       options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
@@ -1307,11 +1319,12 @@ with tab_mean:
         format="%.4f",
         key="mean_ymax",
     )
+  mean_w, mean_h, mean_px = render_aspect_selector(mc5, "mean", default_idx=3)
 
   buf_mean = render_excel_style_row_mean_plot(
-      fig_w, fig_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
+      mean_w, mean_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
   )
-  st.image(buf_mean, width=preview_px_width)
+  st.image(buf_mean, width=mean_px)
   buf_mean.seek(0)
   st.download_button(
       "🖼️ 下载当前单行均值趋势图 (.png)",
