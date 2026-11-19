@@ -78,7 +78,7 @@ else:
 
 plt.rcParams["axes.unicode_minus"] = False
 
-# ==================== 1. 数据源与多参数分组识别 ====================
+# ==================== 1. 数据源与多项目分组识别 ====================
 st.sidebar.header("1️⃣ 数据源与多项目分组")
 uploaded_file = st.sidebar.file_uploader(
     "上传检测数据表 (.xlsx / .csv)", type=["xlsx", "xls", "csv"]
@@ -564,8 +564,48 @@ def compute_within_std(mat, flat_vals):
   return m_mr / 1.12838 if m_mr > 0 else s_ov
 
 
-def build_project_dataset(proj_cols, p_lsl, p_target, p_usl):
-  """为单个项目组生成清洗后数据、被剔除行与异常单点统计"""
+# ==================== 左侧最底部：西格玛 / CPK 波动美化校准 ====================
+st.sidebar.markdown("---")
+with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
+  sigma_target_proj = st.selectbox(
+      "校准作用项目",
+      options=["当前聚焦项目"] + active_projects,
+      index=0,
+  )
+  enable_sigma_tuning = st.checkbox(
+      "启用西格玛美化校准（全图与导出表同步）", value=False
+  )
+  tuning_mode = st.radio(
+      "校准方式",
+      options=["直接指定目标西格玛 (σ)", "按目标 CPK 自动推算西格玛"],
+      index=0,
+  )
+  center_align_pct = st.slider(
+      "均值向 Target 居中比例 (%)",
+      min_value=0,
+      max_value=100,
+      value=0,
+      step=5,
+  )
+  if tuning_mode == "直接指定目标西格玛 (σ)":
+    manual_target_sigma = st.number_input(
+        "目标组内西格玛 (Target Within σ)",
+        min_value=0.000001,
+        value=0.020000,
+        format="%.6f",
+    )
+    target_cpk_goal = 1.33
+  else:
+    manual_target_sigma = None
+    target_cpk_goal = st.selectbox(
+        "目标 CPK 标准",
+        options=[1.33, 1.50, 1.67, 2.00],
+        index=0,
+    )
+
+
+def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
+  """为单个项目组生成清洗后数据、被剔除行、异常单点统计与西格玛校准结果"""
   df_w = df_raw.copy()
   sub_raw = df_w[proj_cols].to_numpy(dtype=float)
   sp_mask = np.zeros_like(sub_raw, dtype=bool)
@@ -634,11 +674,35 @@ def build_project_dataset(proj_cols, p_lsl, p_target, p_usl):
   df_c = df_w[v_mask].copy().reset_index(drop=True)
   df_r = df_raw[~v_mask].copy().reset_index(drop=True)
 
-  s_mat = df_c[proj_cols].to_numpy(dtype=float)
-  v_vals = s_mat[~np.isnan(s_mat)]
-  if len(v_vals) < 2:
+  s_mat_raw = df_c[proj_cols].to_numpy(dtype=float)
+  v_vals_raw = s_mat_raw[~np.isnan(s_mat_raw)]
+  if len(v_vals_raw) < 2:
     return None
 
+  orig_m = float(np.mean(v_vals_raw))
+  orig_wi = compute_within_std(s_mat_raw, v_vals_raw)
+
+  apply_tuning = enable_sigma_tuning and (
+      sigma_target_proj == "当前聚焦项目" and p_name == current_focus_proj
+      or sigma_target_proj == p_name
+  )
+
+  if apply_tuning and orig_wi > 0:
+    adj_mean = orig_m + (p_target - orig_m) * (center_align_pct / 100.0)
+    if tuning_mode == "直接指定目标西格玛 (σ)" and manual_target_sigma is not None:
+      tgt_wi = float(manual_target_sigma)
+    else:
+      min_dist = min(p_usl - adj_mean, adj_mean - p_lsl)
+      tgt_wi = (
+          min_dist / (3.0 * target_cpk_goal) if min_dist > 0 else orig_wi
+      )
+    ratio = tgt_wi / orig_wi
+    for c_name in proj_cols:
+      df_c[c_name] = adj_mean + (df_c[c_name] - orig_m) * ratio
+    df_c["_Row_Mean_"] = df_c[proj_cols].mean(axis=1)
+
+  s_mat = df_c[proj_cols].to_numpy(dtype=float)
+  v_vals = s_mat[~np.isnan(s_mat)]
   s_mean = float(np.mean(v_vals))
   s_ov = float(np.std(v_vals, ddof=1))
   s_wi = compute_within_std(s_mat, v_vals)
@@ -712,7 +776,7 @@ for p_name in active_projects:
   pk = f"{dataset_key}::{p_name}"
   sp = specs_map[pk]
   b_data = build_project_dataset(
-      proj_map[p_name], sp["lsl"], sp["target"], sp["usl"]
+      p_name, proj_map[p_name], sp["lsl"], sp["target"], sp["usl"]
   )
   if b_data is not None:
     project_bundles[p_name] = b_data
