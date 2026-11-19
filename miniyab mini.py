@@ -76,18 +76,14 @@ else:
 
 plt.rcParams["axes.unicode_minus"] = False
 
-st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
-st.caption(
-    "严格对齐 Minitab「子组跨数行」CPK 算法｜支持 SPEC 表头自动识别｜全局屏蔽引擎同步驱动全套四图"
-)
-
-# ==================== 1. 文件上传与 Sheet 选择 ====================
-st.sidebar.header("1️⃣ 数据上传与表头识别")
+# ==================== 左侧边栏：仅保留核心数据与全局屏蔽设置 ====================
+st.sidebar.header("1️⃣ 数据源与检测列")
 uploaded_file = st.sidebar.file_uploader(
-    "上传在线检测数据表 (.xlsx / .csv)", type=["xlsx", "xls", "csv"]
+    "上传检测数据表 (.xlsx / .csv)", type=["xlsx", "xls", "csv"]
 )
 
 if uploaded_file is None:
+  st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
   st.info(
       "👈 请在左侧边栏上传在线检测数据表格（第一行为表头，往下堆叠时间/检测数据）。"
   )
@@ -105,7 +101,7 @@ def load_workbook_sheets(file_bytes, filename):
 
 sheets_dict = load_workbook_sheets(uploaded_file.getvalue(), uploaded_file.name)
 selected_sheet = st.sidebar.selectbox(
-    "选择工作表 (Sheet)", list(sheets_dict.keys())
+    "工作表 (Sheet)", list(sheets_dict.keys())
 )
 df_raw = sheets_dict[selected_sheet].copy()
 df_raw = df_raw.dropna(how="all").reset_index(drop=True)
@@ -132,11 +128,9 @@ if not numeric_cols_all:
   st.stop()
 
 
-# ==================== 自动识别 SPEC 表头与对应数值 ====================
 def detect_spec_from_columns(df, num_cols):
   """根据表头关键字自动匹配 规格下限(LSL)、目标值(Target)、规格上限(USL)"""
   lsl_col, target_col, usl_col = None, None, None
-
   lsl_keywords = ["规格下限", "下限", "下公差", "lsl", "lower"]
   target_keywords = [
       "目标值",
@@ -170,7 +164,6 @@ def detect_spec_from_columns(df, num_cols):
   detected_lsl = extract_representative_val(lsl_col)
   detected_target = extract_representative_val(target_col)
   detected_usl = extract_representative_val(usl_col)
-
   spec_cols_found = {c for c in [lsl_col, target_col, usl_col] if c is not None}
   return {
       "lsl": detected_lsl,
@@ -184,35 +177,30 @@ def detect_spec_from_columns(df, num_cols):
 
 
 spec_info = detect_spec_from_columns(df_raw, numeric_cols_all)
-
 measurement_candidates = [
     c for c in numeric_cols_all if c not in spec_info["spec_cols"]
 ]
 if not measurement_candidates:
   measurement_candidates = numeric_cols_all
 
-# ==================== 2. 检测列选择（子组跨数行） ====================
-st.sidebar.header("2️⃣ 检测数据列选择（子组跨数行）")
 select_all_cols = st.sidebar.checkbox("全选所有检测分区/通道列", value=False)
 default_cols = (
     measurement_candidates
     if select_all_cols
     else measurement_candidates[: min(10, len(measurement_candidates))]
 )
-
 selected_value_cols = st.sidebar.multiselect(
-    "选择参与分析的分区/通道列",
+    "参与分析的分区/通道列",
     options=numeric_cols_all,
     default=default_cols,
 )
 
 if not selected_value_cols:
-  st.warning("请至少选择一列检测数值列。")
+  st.warning("请在左侧至少选择一列检测数值列。")
   st.stop()
 
-# ==================== 3. 在线 SPEC 规格设定（自动引用 + 手动覆盖） ====================
-st.sidebar.header("3️⃣ 在线 SPEC 规格设定")
-
+# ==================== 2. SPEC 规格设定 ====================
+st.sidebar.header("2️⃣ SPEC 规格设定")
 dataset_key = f"{uploaded_file.name}::{selected_sheet}"
 
 fallback_mid = float(
@@ -248,43 +236,24 @@ if st.session_state.get("active_dataset_key") != dataset_key:
   st.session_state["spec_usl_input"] = float(init_usl)
 
 if spec_info["spec_cols"]:
-  matched_desc = []
-  if spec_info["lsl_col"]:
-    matched_desc.append(f"下限=`{spec_info['lsl_col']}`")
-  if spec_info["target_col"]:
-    matched_desc.append(f"目标=`{spec_info['target_col']}`")
-  if spec_info["usl_col"]:
-    matched_desc.append(f"上限=`{spec_info['usl_col']}`")
-  st.sidebar.success(
-      "✅ 已自动识别 SPEC 列：" + "，".join(matched_desc) + "（可直接手动修改）"
-  )
-  if st.sidebar.button("🔄 重置为表格识别的 SPEC", use_container_width=True):
-    st.session_state["spec_lsl_input"] = float(init_lsl)
-    st.session_state["spec_target_input"] = float(init_target)
-    st.session_state["spec_usl_input"] = float(init_usl)
-    st.rerun()
-else:
-  st.sidebar.info("ℹ️ 未检测到 SPEC 表头，请手动输入或使用估算值。")
+  st.sidebar.caption("✅ 已自动匹配表格 SPEC 列（可随时手动改写）")
 
 col_spec1, col_spec2, col_spec3 = st.sidebar.columns(3)
-lsl = col_spec1.number_input("LSL (下限)", key="spec_lsl_input", format="%.4f")
-target = col_spec2.number_input(
-    "Target (目标)", key="spec_target_input", format="%.4f"
-)
-usl = col_spec3.number_input("USL (上限)", key="spec_usl_input", format="%.4f")
+lsl = col_spec1.number_input("LSL", key="spec_lsl_input", format="%.4f")
+target = col_spec2.number_input("Target", key="spec_target_input", format="%.4f")
+usl = col_spec3.number_input("USL", key="spec_usl_input", format="%.4f")
 
 if lsl >= usl:
   st.sidebar.error("⚠️ LSL 必须小于 USL！")
   st.stop()
 
-# ==================== 4. 全局统一数据屏蔽引擎 ====================
-st.sidebar.header("4️⃣ 全局样本屏蔽（同步作用于全套四图）")
-
+# ==================== 3. 全局统一数据屏蔽引擎 ====================
+st.sidebar.header("3️⃣ 全局样本屏蔽")
 exclude_ranges_str = st.sidebar.text_input(
-    "屏蔽指定行号区间（支持多段）",
+    "屏蔽行号区间（支持多段）",
     value="",
     placeholder="例如: 1-250, 600-630",
-    help="输入要剔除的原始行号范围（1开始），多个区间用逗号隔开。屏蔽后 CPK、箱线图、时间序列图及单行均值趋势图将同步使用剩余样本重新计算。",
+    help="剔除指定原始行号范围（1开始），同步作用于全套图表与导出明细。",
 )
 
 
@@ -317,12 +286,12 @@ def parse_exclude_indices(range_text, max_row):
 
 excluded_rows_set = parse_exclude_indices(exclude_ranges_str, len(df_raw))
 
-filter_mode = st.sidebar.radio(
+filter_mode = st.sidebar.selectbox(
     "行均值数值筛选规则",
     options=[
         "不屏蔽（保留全部行）",
-        "按 SPEC 范围过滤（行均值超出 [LSL, USL] 屏蔽）",
-        "按自定义范围过滤（行均值超出设定区间屏蔽）",
+        "按 SPEC 范围过滤（超出 [LSL, USL] 屏蔽）",
+        "按自定义范围过滤（超出设定区间屏蔽）",
     ],
     index=1,
 )
@@ -335,76 +304,27 @@ mask_not_nan = df_work["_Row_Mean_"].notna()
 mask_not_in_range = ~df_work["Row_Index"].isin(excluded_rows_set)
 mask_value_ok = pd.Series(True, index=df_work.index)
 
-if filter_mode == "按 SPEC 范围过滤（行均值超出 [LSL, USL] 屏蔽）":
+if filter_mode == "按 SPEC 范围过滤（超出 [LSL, USL] 屏蔽）":
   mask_value_ok = (df_work["_Row_Mean_"] >= lsl) & (df_work["_Row_Mean_"] <= usl)
-elif filter_mode == "按自定义范围过滤（行均值超出设定区间屏蔽）":
+elif filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
   c_min, c_max = st.sidebar.columns(2)
   custom_min = c_min.number_input(
-      "允许行均值最小值", value=float(lsl), format="%.4f"
+      "允许最小值", value=float(lsl), format="%.4f"
   )
   custom_max = c_max.number_input(
-      "允许行均值最大值", value=float(usl), format="%.4f"
+      "允许最大值", value=float(usl), format="%.4f"
   )
   if custom_min >= custom_max:
-    st.sidebar.error("⚠️ 自定义最小值必须小于最大值！")
+    st.sidebar.error("⚠️ 最小值必须小于最大值！")
     st.stop()
   mask_value_ok = (df_work["_Row_Mean_"] >= custom_min) & (
       df_work["_Row_Mean_"] <= custom_max
   )
 
 valid_mask = mask_not_nan & mask_not_in_range & mask_value_ok
-
 df_clean = df_work[valid_mask].copy().reset_index(drop=True)
 df_removed = df_work[~valid_mask].copy().reset_index(drop=True)
 
-# ==================== 5. 图表标题、细节与坐标轴设置 ====================
-st.sidebar.header("5️⃣ 图表标题与坐标轴设置")
-
-base_topic_name = st.sidebar.text_input(
-    "项目 / 检测参数名称（自动同步至各图标题）",
-    value=selected_sheet,
-    placeholder="例如: 单面面密度",
-)
-
-with st.sidebar.expander("✏️ 单独微调各图表主标题（可选）", expanded=False):
-  custom_title_cap = st.text_input(
-      "过程能力报告标题",
-      value="",
-      placeholder=f"{base_topic_name} — Process Capability Report",
-  )
-  custom_title_box = st.text_input(
-      "箱线图标题",
-      value="",
-      placeholder=f"{base_topic_name} — Box Plot",
-  )
-  custom_title_ts = st.text_input(
-      "多通道时间序列图标题",
-      value="",
-      placeholder=f"{base_topic_name} — Time Series Plot",
-  )
-  custom_title_mean = st.text_input(
-      "单行均值趋势图标题",
-      value="",
-      placeholder=f"{base_topic_name}均值",
-  )
-
-show_box_outliers = st.sidebar.checkbox(
-    "Box Plot 显示异常点（Outliers）", value=False
-)
-
-ts_x_mode = st.sidebar.radio(
-    "趋势图横坐标（X轴）序号",
-    options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
-    index=0,
-)
-
-ts_y_mode = st.sidebar.radio(
-    "趋势图纵坐标（Y轴）尺度",
-    options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
-    index=0,
-)
-
-# 先检查清洗后有效数据量
 raw_sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
 raw_all_valid_vals = raw_sub_matrix[~np.isnan(raw_sub_matrix)]
 
@@ -434,9 +354,9 @@ def compute_within_std(mat, flat_vals):
 orig_mean = float(np.mean(raw_all_valid_vals))
 orig_std_within = compute_within_std(raw_sub_matrix, raw_all_valid_vals)
 
-# ==================== 6. 底部隐蔽高级功能：过程波动校准（自定义西格玛） ====================
+# ==================== 左侧最底部（隐蔽收起）：过程波动校准 ====================
 st.sidebar.markdown("---")
-with st.sidebar.expander("⚙️ 高级过程波动校准（西格玛调节）", expanded=False):
+with st.sidebar.expander("⚙️ 高级过程波动校准", expanded=False):
   enable_sigma_tuning = st.checkbox(
       "启用自定义西格玛校准（全图与导出表同步）", value=False
   )
@@ -445,81 +365,48 @@ with st.sidebar.expander("⚙️ 高级过程波动校准（西格玛调节）",
       options=["直接指定目标西格玛 (σ)", "按目标 CPK 自动推算西格玛"],
       index=0,
   )
-
   center_align_pct = st.slider(
       "均值向 Target 居中比例 (%)",
       min_value=0,
       max_value=100,
       value=0,
       step=5,
-      help="0% 保持原始样本均值不变；100% 将整体均值平移至 Target 中心。",
   )
-
-  # 计算校准后的目标均值
   adjusted_mean = orig_mean + (target - orig_mean) * (center_align_pct / 100.0)
 
   if tuning_mode == "直接指定目标西格玛 (σ)":
     default_sigma = round(max(orig_std_within * 0.7, 0.0001), 6)
     target_sigma_within = st.number_input(
-        "设定目标组内西格玛 (Target Within σ)",
+        "目标组内西格玛 (Target Within σ)",
         min_value=0.000001,
         value=default_sigma,
         format="%.6f",
     )
   else:
     target_cpk_goal = st.selectbox(
-        "选择目标 CPK 标准",
+        "目标 CPK 标准",
         options=[1.33, 1.50, 1.67, 2.00],
         index=0,
     )
-    # 根据当前（或居中后）均值反推达到目标 CPK 所需的组内西格玛
     min_spec_dist = min(usl - adjusted_mean, adjusted_mean - lsl)
     if min_spec_dist <= 0:
-      st.warning("⚠️ 当前均值超出规格限，建议将「均值向 Target 居中比例」调至 50%~100%。")
+      st.warning("⚠️ 当前均值超出规格限，请调高居中比例。")
       target_sigma_within = orig_std_within
     else:
       target_sigma_within = min_spec_dist / (3.0 * target_cpk_goal)
     st.caption(f"自动换算所需组内 σ ≈ `{target_sigma_within:.6f}`")
 
-# 应用自定义西格玛缩放至 df_clean（同步更新所有列及 _Row_Mean_）
 if enable_sigma_tuning and orig_std_within > 0:
   scale_ratio = target_sigma_within / orig_std_within
   for col in selected_value_cols:
     df_clean[col] = adjusted_mean + (df_clean[col] - orig_mean) * scale_ratio
   df_clean["_Row_Mean_"] = df_clean[selected_value_cols].mean(axis=1)
 
-# 提取最终用于四张图与导出的统一数据矩阵
+# 统一数据矩阵
 sub_matrix = df_clean[selected_value_cols].to_numpy(dtype=float)
 all_valid_vals = sub_matrix[~np.isnan(sub_matrix)]
 
-default_ymin = (
-    float(np.min(all_valid_vals)) if len(all_valid_vals) > 0 else float(lsl)
-)
-default_ymax = (
-    float(np.max(all_valid_vals)) if len(all_valid_vals) > 0 else float(usl)
-)
-pad = max((default_ymax - default_ymin) * 0.1, 0.02)
-
-ts_ymin, ts_ymax = None, None
-if ts_y_mode == "自定义范围 (Manual)":
-  yc1, yc2 = st.sidebar.columns(2)
-  ts_ymin = yc1.number_input(
-      "Y轴最小值 (Y-Min)", value=round(default_ymin - pad, 4), format="%.4f"
-  )
-  ts_ymax = yc2.number_input(
-      "Y轴最大值 (Y-Max)", value=round(default_ymax + pad, 4), format="%.4f"
-  )
-  if ts_ymin >= ts_ymax:
-    st.sidebar.error("⚠️ 趋势图 Y 轴最小值必须小于最大值！")
-    st.stop()
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("原始数据行数", len(df_work))
-m2.metric("四图共用有效行数", len(df_clean))
-m3.metric("已全局屏蔽行数", len(df_removed))
-m4.metric("四图共用总样本数 N", len(all_valid_vals))
-
-# ==================== 7. Minitab「子组跨数行」核心统计计算 ====================
+# ==================== Minitab 核心统计计算 ====================
 total_n = len(all_valid_vals)
 sample_mean = float(np.mean(all_valid_vals))
 std_overall = float(np.std(all_valid_vals, ddof=1))
@@ -564,7 +451,44 @@ exp_wi_gt_usl = (
 )
 exp_wi_total = exp_wi_lt_lsl + exp_wi_gt_usl
 
-# 组装最终四图标题
+# ==================== 右侧主工作区：顶部概览与紧凑标题栏 ====================
+st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("原始数据行数", len(df_work))
+m2.metric("有效分析行数", len(df_clean))
+m3.metric("已全局屏蔽行数", len(df_removed))
+m4.metric("总样本数 N", len(all_valid_vals))
+
+with st.expander("✏️ 自定义项目名称与各图表主标题（点击展开）", expanded=False):
+  t_col0, t_col1, t_col2 = st.columns(3)
+  base_topic_name = t_col0.text_input(
+      "项目 / 检测参数名称（自动同步至各图）",
+      value=selected_sheet,
+      placeholder="例如: 单面面密度",
+  )
+  custom_title_cap = t_col1.text_input(
+      "过程能力报告标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name} — Process Capability Report",
+  )
+  custom_title_box = t_col2.text_input(
+      "分组箱线图标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name} — Box Plot",
+  )
+  t_col3, t_col4 = st.columns(2)
+  custom_title_ts = t_col3.text_input(
+      "多通道时间序列图标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name} — Time Series Plot",
+  )
+  custom_title_mean = t_col4.text_input(
+      "单行均值趋势图标题（留空自动生成）",
+      value="",
+      placeholder=f"{base_topic_name}均值",
+  )
+
 topic_clean = (
     base_topic_name.strip() if base_topic_name.strip() else selected_sheet
 )
@@ -590,7 +514,7 @@ final_title_mean = (
 )
 
 
-# ==================== 8. 独立单张图表生成函数 ====================
+# ==================== 图表渲染函数 ====================
 def render_capability_plot():
   fig = plt.figure(figsize=(14, 6.2), dpi=160)
   fig.patch.set_facecolor("white")
@@ -758,21 +682,28 @@ def render_capability_plot():
   return buf
 
 
-def render_box_plot():
-  fig, ax = plt.subplots(figsize=(14, 5.8), dpi=160)
+def render_box_plot(
+    show_outliers=False,
+    show_median_val=True,
+    show_mean_val=False,
+    decimals=4,
+):
+  fig, ax = plt.subplots(figsize=(14.5, 5.8), dpi=160)
   fig.patch.set_facecolor("white")
 
   box_data = [
       df_clean[c].dropna().to_numpy(dtype=float) for c in selected_value_cols
   ]
   box_labels = [str(c) for c in selected_value_cols]
+  n_boxes = len(box_data)
+  box_width = 0.42 if n_boxes <= 15 else 0.36
 
   ax.boxplot(
       box_data,
       tick_labels=box_labels,
       patch_artist=True,
-      showfliers=show_box_outliers,
-      widths=0.45,
+      showfliers=show_outliers,
+      widths=box_width,
       boxprops=dict(facecolor="#78A2CC", edgecolor="#2B4C7E", linewidth=1.0),
       medianprops=dict(color="#111827", linewidth=1.3),
       whiskerprops=dict(color="#2B4C7E", linewidth=1.0),
@@ -788,6 +719,91 @@ def render_box_plot():
   ax.axhline(usl, color="#DC2626", ls="--", lw=1.2)
   ax.axhline(target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
   ax.axhline(lsl, color="#DC2626", ls="--", lw=1.2)
+
+  # 计算合适的字体大小，防止多箱体时文字重叠
+  label_font_size = 8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0)
+  x_offset = box_width * 0.54
+  fmt_str = f"{{:.{decimals}f}}"
+
+  # 若开启均值显示，绘制均值标记点
+  if show_mean_val:
+    means_arr = [float(np.mean(arr)) if len(arr) > 0 else np.nan for arr in box_data]
+    ax.scatter(
+        np.arange(1, n_boxes + 1),
+        means_arr,
+        color="#1D4ED8",
+        edgecolor="white",
+        s=24,
+        zorder=5,
+        label="Mean",
+    )
+
+  # 标注中位数与/或均值数值
+  y_min_cur, y_max_cur = ax.get_ylim()
+  y_span_cur = max(y_max_cur - y_min_cur, 1e-6)
+
+  for idx, arr in enumerate(box_data):
+    if len(arr) == 0:
+      continue
+    x_pos = (idx + 1) + x_offset
+    med_v = float(np.median(arr))
+    mean_v = float(np.mean(arr))
+
+    if show_median_val and show_mean_val:
+      # 同时显示两者时，自动拉开垂直间距防止文字重叠
+      min_gap = y_span_cur * 0.032
+      y_med_txt = med_v
+      y_mean_txt = mean_v
+      if abs(y_mean_txt - y_med_txt) < min_gap:
+        if y_mean_txt >= y_med_txt:
+          y_mean_txt = med_v + min_gap * 0.6
+          y_med_txt = med_v - min_gap * 0.6
+        else:
+          y_mean_txt = med_v - min_gap * 0.6
+          y_med_txt = med_v + min_gap * 0.6
+
+      ax.text(
+          x_pos,
+          y_med_txt,
+          f"Med:{fmt_str.format(med_v)}",
+          va="center",
+          ha="left",
+          fontsize=label_font_size,
+          color="#1F2937",
+      )
+      ax.text(
+          x_pos,
+          y_mean_txt,
+          f"Avg:{fmt_str.format(mean_v)}",
+          va="center",
+          ha="left",
+          fontsize=label_font_size,
+          color="#1D4ED8",
+      )
+    elif show_median_val:
+      ax.text(
+          x_pos,
+          med_v,
+          fmt_str.format(med_v),
+          va="center",
+          ha="left",
+          fontsize=label_font_size,
+          color="#1F2937",
+      )
+    elif show_mean_val:
+      ax.text(
+          x_pos,
+          mean_v,
+          fmt_str.format(mean_v),
+          va="center",
+          ha="left",
+          fontsize=label_font_size,
+          color="#1D4ED8",
+      )
+
+  # 右侧留出余量，确保最后一个箱体右侧的数值不会被边框裁切
+  if show_median_val or show_mean_val:
+    ax.set_xlim(0.4, n_boxes + 0.95)
 
   ax_r = ax.twinx()
   ax_r.set_ylim(ax.get_ylim())
@@ -808,7 +824,7 @@ def render_box_plot():
   )
   ax.set_ylabel("Value", fontsize=10.5)
   ax.tick_params(
-      axis="x", rotation=45 if len(box_labels) > 8 else 0, labelsize=9
+      axis="x", rotation=45 if len(box_labels) > 6 else 0, labelsize=9
   )
   for lbl in ax.get_xticklabels():
     lbl.set_fontproperties(FONT_PROP)
@@ -822,11 +838,11 @@ def render_box_plot():
   return buf
 
 
-def render_time_series_plot():
+def render_time_series_plot(x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None):
   fig, ax = plt.subplots(figsize=(14, 5.8), dpi=160)
   fig.patch.set_facecolor("white")
 
-  if ts_x_mode == "保留原始表格行号 (Row Index)":
+  if x_mode_opt == "保留原始表格行号 (Row Index)":
     x_seq = df_clean["Row_Index"].to_numpy(dtype=int)
     x_label_text = "Original Row Index"
   else:
@@ -856,11 +872,12 @@ def render_time_series_plot():
   ax.axhline(lsl, color="#DC2626", ls="--", lw=1.2)
 
   if (
-      ts_y_mode == "自定义范围 (Manual)"
-      and ts_ymin is not None
-      and ts_ymax is not None
+      y_mode_opt == "自定义范围 (Manual)"
+      and ymin_val is not None
+      and ymax_val is not None
+      and ymin_val < ymax_val
   ):
-    ax.set_ylim(ts_ymin, ts_ymax)
+    ax.set_ylim(ymin_val, ymax_val)
 
   ax.set_title(
       final_title_ts,
@@ -905,13 +922,15 @@ def render_time_series_plot():
   return buf
 
 
-def render_excel_style_row_mean_plot():
-  """复刻经典 Excel 折线图风格的单行均值趋势图（含目标值、规格上限、规格下限、平均值）"""
+def render_excel_style_row_mean_plot(
+    x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
+):
+  """复刻经典 Excel 折线图风格的单行均值趋势图"""
   fig, ax = plt.subplots(figsize=(13.5, 5.6), dpi=160)
   fig.patch.set_facecolor("white")
   ax.set_facecolor("white")
 
-  if ts_x_mode == "保留原始表格行号 (Row Index)":
+  if x_mode_opt == "保留原始表格行号 (Row Index)":
     x_seq = df_clean["Row_Index"].to_numpy(dtype=int)
   else:
     x_seq = np.arange(1, len(df_clean) + 1)
@@ -948,11 +967,12 @@ def render_excel_style_row_mean_plot():
   )
 
   if (
-      ts_y_mode == "自定义范围 (Manual)"
-      and ts_ymin is not None
-      and ts_ymax is not None
+      y_mode_opt == "自定义范围 (Manual)"
+      and ymin_val is not None
+      and ymax_val is not None
+      and ymin_val < ymax_val
   ):
-    ax.set_ylim(ts_ymin, ts_ymax)
+    ax.set_ylim(ymin_val, ymax_val)
   else:
     spec_span = usl - lsl
     y_low = min(
@@ -1018,7 +1038,7 @@ def render_excel_style_row_mean_plot():
   return buf
 
 
-# ==================== 9. 独立分标签页单张大图展示 ====================
+# ==================== 独立分标签页（各图设置内嵌于对应页面上方） ====================
 tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
     "1️⃣ 过程能力报告 (CPK)",
     "2️⃣ 分组箱线图 (Box Plot)",
@@ -1041,7 +1061,20 @@ with tab_cap:
   )
 
 with tab_box:
-  buf_box = render_box_plot()
+  bc1, bc2, bc3, bc4 = st.columns([1.3, 1.3, 1.4, 1.2])
+  show_box_median = bc1.checkbox("显示中位数数值 (Median)", value=True)
+  show_box_mean = bc2.checkbox("显示均值数值 (Mean)", value=False)
+  show_box_outliers = bc3.checkbox("显示异常点 (Outliers)", value=False)
+  box_decimals = bc4.selectbox(
+      "数值小数位", options=[2, 3, 4, 5, 6], index=2, label_visibility="collapsed"
+  )
+
+  buf_box = render_box_plot(
+      show_outliers=show_box_outliers,
+      show_median_val=show_box_median,
+      show_mean_val=show_box_mean,
+      decimals=box_decimals,
+  )
   st.image(buf_box, width="stretch")
   buf_box.seek(0)
   st.download_button(
@@ -1052,7 +1085,33 @@ with tab_box:
   )
 
 with tab_ts:
-  buf_ts = render_time_series_plot()
+  tc1, tc2, tc3, tc4 = st.columns([1.8, 1.5, 1.0, 1.0])
+  ts_x_mode = tc1.selectbox(
+      "X轴序号",
+      options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
+      index=0,
+      key="ts_x_mode",
+  )
+  ts_y_mode = tc2.selectbox(
+      "Y轴尺度",
+      options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
+      index=0,
+      key="ts_y_mode",
+  )
+  default_ymin = float(np.min(all_valid_vals))
+  default_ymax = float(np.max(all_valid_vals))
+  pad = max((default_ymax - default_ymin) * 0.1, 0.02)
+
+  ts_ymin, ts_ymax = None, None
+  if ts_y_mode == "自定义范围 (Manual)":
+    ts_ymin = tc3.number_input(
+        "Y-Min", value=round(default_ymin - pad, 4), format="%.4f", key="ts_ymin"
+    )
+    ts_ymax = tc4.number_input(
+        "Y-Max", value=round(default_ymax + pad, 4), format="%.4f", key="ts_ymax"
+    )
+
+  buf_ts = render_time_series_plot(ts_x_mode, ts_y_mode, ts_ymin, ts_ymax)
   st.image(buf_ts, width="stretch")
   buf_ts.seek(0)
   st.download_button(
@@ -1063,7 +1122,38 @@ with tab_ts:
   )
 
 with tab_mean:
-  buf_mean = render_excel_style_row_mean_plot()
+  mc1, mc2, mc3, mc4 = st.columns([1.8, 1.5, 1.0, 1.0])
+  mean_x_mode = mc1.selectbox(
+      "X轴序号",
+      options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
+      index=0,
+      key="mean_x_mode",
+  )
+  mean_y_mode = mc2.selectbox(
+      "Y轴尺度",
+      options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
+      index=0,
+      key="mean_y_mode",
+  )
+  mean_ymin, mean_ymax = None, None
+  if mean_y_mode == "自定义范围 (Manual)":
+    spec_span = usl - lsl
+    mean_ymin = mc3.number_input(
+        "Y-Min",
+        value=round(lsl - 0.5 * spec_span, 4),
+        format="%.4f",
+        key="mean_ymin",
+    )
+    mean_ymax = mc4.number_input(
+        "Y-Max",
+        value=round(usl + 0.25 * spec_span, 4),
+        format="%.4f",
+        key="mean_ymax",
+    )
+
+  buf_mean = render_excel_style_row_mean_plot(
+      mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
+  )
   st.image(buf_mean, width="stretch")
   buf_mean.seek(0)
   st.download_button(
