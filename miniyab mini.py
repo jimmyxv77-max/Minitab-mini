@@ -47,7 +47,6 @@ selected_sheet = st.sidebar.selectbox(
 )
 df_raw = sheets_dict[selected_sheet].copy()
 
-# 清理完全空行/空列
 df_raw = df_raw.dropna(how="all").reset_index(drop=True)
 
 if df_raw.empty:
@@ -345,7 +344,7 @@ ax1.text(
     bbox=dict(boxstyle="round,pad=0.5", facecolor="#F8FAFC", edgecolor="#CBD5E1"),
 )
 
-# 左下：箱线图 Box Plot（支持异常点显示/隐藏）
+# 左下：箱线图 Box Plot（兼容 Matplotlib 3.9+ tick_labels 参数）
 ax2 = fig.add_subplot(2, 2, 3)
 flier_props = dict(
     marker="o",
@@ -353,6 +352,14 @@ flier_props = dict(
     markeredgecolor="#DC2626",
     markersize=4.5,
 )
+mean_props = dict(
+    marker="D",
+    markerfacecolor="#E67E22",
+    markeredgecolor="black",
+    markersize=5.5,
+)
+median_props = dict(color="#111827", linewidth=1.8)
+box_props = dict(facecolor="#93C5FD", edgecolor="#1E40AF", alpha=0.85)
 
 if selected_group_col != "无分组（整体分析）":
   grp_series = df_clean[selected_group_col].astype(str)
@@ -369,18 +376,13 @@ if selected_group_col != "无分组（整体分析）":
     data_bp = [item[1] for item in grp_data_filtered]
     ax2.boxplot(
         data_bp,
-        labels=labels_bp,
+        tick_labels=labels_bp,
         patch_artist=True,
         showmeans=True,
         showfliers=show_box_outliers,
-        meanprops=dict(
-            marker="D",
-            markerfacecolor="#E67E22",
-            markeredgecolor="black",
-            markersize=5.5,
-        ),
-        medianprops=dict(color="#111827", linewidth=1.8),
-        boxprops=dict(facecolor="#93C5FD", edgecolor="#1E40AF", alpha=0.85),
+        meanprops=mean_props,
+        medianprops=median_props,
+        boxprops=box_props,
         flierprops=flier_props,
     )
     ax2.set_title(
@@ -391,28 +393,26 @@ if selected_group_col != "无分组（整体分析）":
   else:
     ax2.boxplot(
         [y],
-        labels=["All Data"],
+        tick_labels=["All Data"],
         patch_artist=True,
         showmeans=True,
         showfliers=show_box_outliers,
+        meanprops=mean_props,
+        medianprops=median_props,
+        boxprops=box_props,
         flierprops=flier_props,
     )
     ax2.set_title("Box Plot (All Data)", fontsize=11.5, fontweight="bold")
 else:
   ax2.boxplot(
       [y],
-      labels=["All Data"],
+      tick_labels=["All Data"],
       patch_artist=True,
       showmeans=True,
       showfliers=show_box_outliers,
-      meanprops=dict(
-          marker="D",
-          markerfacecolor="#E67E22",
-          markeredgecolor="black",
-          markersize=6,
-      ),
-      medianprops=dict(color="#111827", linewidth=2),
-      boxprops=dict(facecolor="#93C5FD", edgecolor="#1E40AF", alpha=0.85),
+      meanprops=mean_props,
+      medianprops=median_props,
+      boxprops=box_props,
       flierprops=flier_props,
   )
   ax2.set_title("Box Plot (All Valid Rows)", fontsize=11.5, fontweight="bold")
@@ -424,7 +424,7 @@ ax2.set_ylabel("Row Mean Value", fontsize=9.5)
 ax2.legend(loc="best", fontsize=8)
 ax2.grid(True, ls=":", alpha=0.4)
 
-# 右下：时间序列 / 移动单值控制图 (I Chart)（支持 Y 轴自定义）
+# 右下：时间序列 / 移动单值控制图 (I Chart)
 ax3 = fig.add_subplot(2, 2, 4)
 x_idx = np.arange(1, n + 1)
 ax3.plot(
@@ -466,7 +466,7 @@ img_buf.seek(0)
 plt.close(fig)
 
 st.subheader("📊 Minitab 风格综合分析图表")
-st.image(img_buf, use_container_width=True)
+st.image(img_buf, width="stretch")
 
 dl_col1, dl_col2 = st.columns(2)
 with dl_col1:
@@ -494,6 +494,6 @@ with dl_col2:
 with st.expander("🔍 查看屏蔽后有效数据与被剔除的异常行", expanded=False):
   t1, t2 = st.tabs(["有效数据 (Valid)", "被屏蔽异常行 (Filtered Out)"])
   with t1:
-    st.dataframe(df_clean, use_container_width=True)
+    st.dataframe(df_clean, width="stretch")
   with t2:
-    st.dataframe(df_removed, use_container_width=True)
+    st.dataframe(df_removed, width="stretch")
