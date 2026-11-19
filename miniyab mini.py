@@ -404,6 +404,8 @@ if st.session_state.get("active_dataset_key") != dataset_key:
   }
   st.session_state["selection_dirty"] = False
   st.session_state["project_specs_map"] = {}
+  st.session_state["draft_specs_map"] = {}
+  st.session_state["spec_dirty"] = False
 
 proj_map = st.session_state.setdefault(
     "project_groups_map", {k: list(v) for k, v in inferred_groups.items()}
@@ -421,7 +423,7 @@ selected_projects = st.sidebar.multiselect(
     options=available_proj_names,
     default=draft_default,
     key=f"ms_draft_projects_{dataset_key}",
-    help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新图表」，避免误选列拖慢操作。",
+    help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新所选项目图表」，避免误选列拖慢操作。",
 )
 st.session_state["draft_projects"] = selected_projects
 
@@ -479,44 +481,6 @@ if (
 ):
   st.session_state["selection_dirty"] = True
 
-generate_clicked = st.sidebar.button(
-    "🚀 生成 / 更新所选项目图表",
-    key=f"btn_gen_charts_{dataset_key}",
-    type="primary",
-    use_container_width=True,
-)
-if generate_clicked:
-  st.session_state["confirmed_projects"] = list(current_selected_non_empty)
-  st.session_state["confirmed_groups_snapshot"] = {
-      p: list(proj_map.get(p, [])) for p in current_selected_non_empty
-  }
-  st.session_state["selection_dirty"] = False
-
-if st.session_state.get("selection_dirty", False):
-  render_app_header()
-  if not current_selected_non_empty:
-    st.info(
-        "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目（或展开**「调整各项目包含的通道列」**），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
-    )
-  else:
-    st.warning(
-        f"👈 检测到项目或通道列选择已变更（当前已选 {len(current_selected_non_empty)} 个项目：{', '.join(current_selected_non_empty)}）。已暂停自动出图，请点击左侧 **「🚀 生成 / 更新所选项目图表」** 开始生成。"
-    )
-  st.stop()
-
-confirmed_projects = [
-    p
-    for p in st.session_state.get("confirmed_projects", [])
-    if p in available_proj_names and len(proj_map.get(p, [])) > 0
-]
-
-if not confirmed_projects:
-  render_app_header()
-  st.info(
-      "👈 请在左侧**「待生成项目 / 参数组」**中选择至少一个项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
-  )
-  st.stop()
-
 
 def compute_recommended_spec(df_src, cols_sel, s_info):
   """使用中位数与抗差标准差(MAD)估算 SPEC，避免编码器尖峰带偏上下限"""
@@ -546,14 +510,76 @@ def compute_recommended_spec(df_src, cols_sel, s_info):
 
 
 specs_map = st.session_state.setdefault("project_specs_map", {})
-for p_name in confirmed_projects:
+draft_specs_map = st.session_state.setdefault("draft_specs_map", {})
+
+for p_name in current_selected_non_empty:
   p_key = f"{dataset_key}::{p_name}"
   if p_key not in specs_map:
     rl, rt, ru = compute_recommended_spec(df_raw, proj_map[p_name], spec_info)
     specs_map[p_key] = {"lsl": rl, "target": rt, "usl": ru}
+  if p_key not in draft_specs_map:
+    draft_specs_map[p_key] = dict(specs_map[p_key])
 
-# ==================== 2. 各项目 SPEC 规格设定 ====================
+
+def _sync_draft_spec(p_key, field_name, widget_key):
+  draft_specs_map.setdefault(p_key, dict(specs_map.get(p_key, {})))
+  draft_specs_map[p_key][field_name] = float(st.session_state[widget_key])
+  st.session_state["spec_dirty"] = True
+
+
+generate_clicked = st.sidebar.button(
+    "🚀 生成 / 更新所选项目图表",
+    key=f"btn_gen_charts_{dataset_key}",
+    type="primary",
+    use_container_width=True,
+)
+if generate_clicked:
+  st.session_state["confirmed_projects"] = list(current_selected_non_empty)
+  st.session_state["confirmed_groups_snapshot"] = {
+      p: list(proj_map.get(p, [])) for p in current_selected_non_empty
+  }
+  st.session_state["selection_dirty"] = False
+  for p_name in current_selected_non_empty:
+    p_key = f"{dataset_key}::{p_name}"
+    if p_key in draft_specs_map:
+      cand = draft_specs_map[p_key]
+      if cand.get("lsl", 0.0) < cand.get("usl", 0.0):
+        specs_map[p_key] = {
+            "lsl": float(cand["lsl"]),
+            "target": float(cand["target"]),
+            "usl": float(cand["usl"]),
+        }
+  st.session_state["spec_dirty"] = False
+
+if st.session_state.get("selection_dirty", False):
+  render_app_header()
+  if not current_selected_non_empty:
+    st.info(
+        "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目（或展开**「调整各项目包含的通道列」**），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+    )
+  else:
+    st.warning(
+        f"👈 检测到项目或通道列选择已变更（当前已选 {len(current_selected_non_empty)} 个项目：{', '.join(current_selected_non_empty)}）。已暂停自动出图，请点击左侧 **「🚀 生成 / 更新所选项目图表」** 开始生成。"
+    )
+  st.stop()
+
+confirmed_projects = [
+    p
+    for p in st.session_state.get("confirmed_projects", [])
+    if p in available_proj_names and len(proj_map.get(p, [])) > 0
+]
+
+if not confirmed_projects:
+  render_app_header()
+  st.info(
+      "👈 请在左侧**「待生成项目 / 参数组」**中选择至少一个项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+  )
+  st.stop()
+
+# ==================== 2. 各项目 SPEC 规格设定（草稿暂存，点按钮统一更新） ====================
 st.sidebar.header("2️⃣ 各项目 SPEC 规格")
+st.sidebar.caption("修改上下限或目标值时不会实时刷新图表，点上方按钮统一生效")
+
 current_focus_proj = st.sidebar.selectbox(
     "当前编辑 SPEC 的项目",
     options=confirmed_projects,
@@ -561,37 +587,47 @@ current_focus_proj = st.sidebar.selectbox(
     key=f"focus_spec_proj_{dataset_key}",
 )
 focus_key = f"{dataset_key}::{current_focus_proj}"
-cur_spec = specs_map[focus_key]
+cur_draft_spec = draft_specs_map.setdefault(
+    focus_key, dict(specs_map[focus_key])
+)
 
 sc1, sc2, sc3 = st.sidebar.columns(3)
-f_lsl = sc1.number_input(
+lsl_w_key = f"num_lsl_{focus_key}"
+tgt_w_key = f"num_target_{focus_key}"
+usl_w_key = f"num_usl_{focus_key}"
+
+sc1.number_input(
     "LSL",
-    value=float(cur_spec["lsl"]),
+    value=float(cur_draft_spec["lsl"]),
     format="%.4f",
-    key=f"num_lsl_{focus_key}",
+    key=lsl_w_key,
+    on_change=_sync_draft_spec,
+    args=(focus_key, "lsl", lsl_w_key),
 )
-f_target = sc2.number_input(
+sc2.number_input(
     "Target",
-    value=float(cur_spec["target"]),
+    value=float(cur_draft_spec["target"]),
     format="%.4f",
-    key=f"num_target_{focus_key}",
+    key=tgt_w_key,
+    on_change=_sync_draft_spec,
+    args=(focus_key, "target", tgt_w_key),
 )
-f_usl = sc3.number_input(
+sc3.number_input(
     "USL",
-    value=float(cur_spec["usl"]),
+    value=float(cur_draft_spec["usl"]),
     format="%.4f",
-    key=f"num_usl_{focus_key}",
+    key=usl_w_key,
+    on_change=_sync_draft_spec,
+    args=(focus_key, "usl", usl_w_key),
 )
 
-if f_lsl >= f_usl:
-  st.sidebar.error(f"⚠️ [{current_focus_proj}] LSL 必须小于 USL！")
-  st.stop()
+active_draft_lsl = float(draft_specs_map[focus_key]["lsl"])
+active_draft_usl = float(draft_specs_map[focus_key]["usl"])
+if active_draft_lsl >= active_draft_usl:
+  st.sidebar.warning(f"⚠️ [{current_focus_proj}] LSL 应小于 USL，生效前请修正。")
 
-specs_map[focus_key] = {
-    "lsl": float(f_lsl),
-    "target": float(f_target),
-    "usl": float(f_usl),
-}
+if st.session_state.get("spec_dirty", False):
+  st.sidebar.info("SPEC 已修改待生效：请点击上方「🚀 生成 / 更新所选项目图表」")
 
 if st.sidebar.button(
     f"🔄 重新自动估算 [{current_focus_proj}] SPEC",
@@ -601,38 +637,53 @@ if st.sidebar.button(
   rl, rt, ru = compute_recommended_spec(
       df_raw, proj_map[current_focus_proj], spec_info
   )
-  specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
+  draft_specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
+  st.session_state[lsl_w_key] = rl
+  st.session_state[tgt_w_key] = rt
+  st.session_state[usl_w_key] = ru
+  st.session_state["spec_dirty"] = True
   st.rerun()
 
 if len(confirmed_projects) > 1:
   with st.sidebar.expander("📋 批量查看/修改全部已生成项目 SPEC", expanded=False):
     for p_name in confirmed_projects:
       pk = f"{dataset_key}::{p_name}"
+      d_sp = draft_specs_map.setdefault(pk, dict(specs_map[pk]))
       st.caption(f"**{p_name}**")
       b1, b2, b3 = st.columns(3)
-      nl = b1.number_input(
+      bl_k = f"batch_lsl_{pk}"
+      bt_k = f"batch_tgt_{pk}"
+      bu_k = f"batch_usl_{pk}"
+      b1.number_input(
           "LSL",
-          value=float(specs_map[pk]["lsl"]),
+          value=float(d_sp["lsl"]),
           format="%.4f",
-          key=f"batch_lsl_{pk}",
+          key=bl_k,
+          on_change=_sync_draft_spec,
+          args=(pk, "lsl", bl_k),
       )
-      nt = b2.number_input(
+      b2.number_input(
           "Target",
-          value=float(specs_map[pk]["target"]),
+          value=float(d_sp["target"]),
           format="%.4f",
-          key=f"batch_tgt_{pk}",
+          key=bt_k,
+          on_change=_sync_draft_spec,
+          args=(pk, "target", bt_k),
       )
-      nu = b3.number_input(
+      b3.number_input(
           "USL",
-          value=float(specs_map[pk]["usl"]),
+          value=float(d_sp["usl"]),
           format="%.4f",
-          key=f"batch_usl_{pk}",
+          key=bu_k,
+          on_change=_sync_draft_spec,
+          args=(pk, "usl", bu_k),
       )
-      if nl < nu:
-        specs_map[pk] = {"lsl": float(nl), "target": float(nt), "usl": float(nu)}
 
 # ==================== 3. 全局统一数据屏蔽引擎 ====================
 st.sidebar.header("3️⃣ 全局样本屏蔽")
+
+active_ref_lsl = float(specs_map[focus_key]["lsl"])
+active_ref_usl = float(specs_map[focus_key]["usl"])
 
 spike_mode = st.sidebar.selectbox(
     "单点极端尖峰屏蔽（传感器/编码器 Bug）",
@@ -685,13 +736,13 @@ elif spike_mode == "自定义单点有效数值区间":
   sp_c1, sp_c2 = st.sidebar.columns(2)
   pt_min_val = sp_c1.number_input(
       "单点最小值",
-      value=float(f_lsl - (f_usl - f_lsl)),
+      value=float(active_ref_lsl - (active_ref_usl - active_ref_lsl)),
       format="%.4f",
       key=f"pt_min_{dataset_key}",
   )
   pt_max_val = sp_c2.number_input(
       "单点最大值",
-      value=float(f_usl + (f_usl - f_lsl)),
+      value=float(active_ref_usl + (active_ref_usl - active_ref_lsl)),
       format="%.4f",
       key=f"pt_max_{dataset_key}",
   )
@@ -758,13 +809,13 @@ if filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
   c_min, c_max = st.sidebar.columns(2)
   custom_min = c_min.number_input(
       "允许最小值",
-      value=float(f_lsl),
+      value=float(active_ref_lsl),
       format="%.4f",
       key=f"c_min_{dataset_key}",
   )
   custom_max = c_max.number_input(
       "允许最大值",
-      value=float(f_usl),
+      value=float(active_ref_usl),
       format="%.4f",
       key=f"c_max_{dataset_key}",
   )
@@ -1008,6 +1059,8 @@ project_bundles = {}
 for p_name in confirmed_projects:
   pk = f"{dataset_key}::{p_name}"
   sp = specs_map[pk]
+  if sp["lsl"] >= sp["usl"]:
+    continue
   b_data = build_project_dataset(
       p_name, proj_map[p_name], sp["lsl"], sp["target"], sp["usl"]
   )
@@ -1015,7 +1068,9 @@ for p_name in confirmed_projects:
     project_bundles[p_name] = b_data
 
 if not project_bundles:
-  st.error("当前筛选条件下，所选项目有效数据点不足 2 个，请放宽过滤规则。")
+  st.error(
+      "当前筛选条件下，所选项目有效数据点不足 2 个或 SPEC 范围无效，请调整后点击「生成 / 更新所选项目图表」。"
+  )
   st.stop()
 
 ready_projects = list(project_bundles.keys())
