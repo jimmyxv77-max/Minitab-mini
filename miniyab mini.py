@@ -790,38 +790,60 @@ ready_projects = list(project_bundles.keys())
 # ==================== 顶部栏：标题、浅灰外边框开关与多项目一键 ZIP 打包 ====================
 st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
 
+
+def default_titles_for_project(p_name):
+  return (
+      f"{p_name} — Process Capability Report",
+      f"{p_name} — Box Plot",
+      f"{p_name} — Time Series Plot",
+      f"{p_name}均值",
+  )
+
+
+def ensure_project_title_keys(p_name):
+  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
+  k_cap = f"t_cap_{dataset_key}_{p_name}"
+  k_box = f"t_box_{dataset_key}_{p_name}"
+  k_ts = f"t_ts_{dataset_key}_{p_name}"
+  k_mean = f"t_mean_{dataset_key}_{p_name}"
+  if k_cap not in st.session_state:
+    st.session_state[k_cap] = d_cap
+  if k_box not in st.session_state:
+    st.session_state[k_box] = d_box
+  if k_ts not in st.session_state:
+    st.session_state[k_ts] = d_ts
+  if k_mean not in st.session_state:
+    st.session_state[k_mean] = d_mean
+  return k_cap, k_box, k_ts, k_mean
+
+
 top_bar1, top_bar2 = st.columns([3.5, 1.2])
 with top_bar1:
-  with st.expander("✏️ 自定义各项目图表主标题（点击展开）", expanded=False):
+  with st.expander(
+      "✏️ 自定义各项目图表主标题（默认保留标准后缀，特殊情况可直接删改）",
+      expanded=False,
+  ):
     title_target_proj = st.selectbox(
         "选择要自定义标题的项目", options=ready_projects, key="title_proj_sel"
     )
+    k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(title_target_proj)
     t_c1, t_c2 = st.columns(2)
-    c_cap = t_c1.text_input(
-        "能力报告标题（留空自动生成）",
-        value="",
-        placeholder=f"{title_target_proj} — Process Capability Report",
-        key=f"t_cap_{title_target_proj}",
-    )
-    c_box = t_c2.text_input(
-        "箱线图标题（留空自动生成）",
-        value="",
-        placeholder=f"{title_target_proj} — Box Plot",
-        key=f"t_box_{title_target_proj}",
-    )
+    t_c1.text_input("能力报告标题", key=k_cap)
+    t_c2.text_input("箱线图标题", key=k_box)
     t_c3, t_c4 = st.columns(2)
-    c_ts = t_c3.text_input(
-        "时间序列图标题（留空自动生成）",
-        value="",
-        placeholder=f"{title_target_proj} — Time Series Plot",
-        key=f"t_ts_{title_target_proj}",
-    )
-    c_mean = t_c4.text_input(
-        "单行均值图标题（留空自动生成）",
-        value="",
-        placeholder=f"{title_target_proj}均值",
-        key=f"t_mean_{title_target_proj}",
-    )
+    t_c3.text_input("时间序列图标题", key=k_ts)
+    t_c4.text_input("单行均值图标题", key=k_mean)
+
+    if st.button(
+        f"↩️ 恢复 [{title_target_proj}] 默认标准后缀标题",
+        key=f"reset_titles_{dataset_key}_{title_target_proj}",
+    ):
+      d_cap, d_box, d_ts, d_mean = default_titles_for_project(title_target_proj)
+      st.session_state[k_cap] = d_cap
+      st.session_state[k_box] = d_box
+      st.session_state[k_ts] = d_ts
+      st.session_state[k_mean] = d_mean
+      st.rerun()
 
 with top_bar2:
   show_outer_border = st.checkbox(
@@ -832,15 +854,18 @@ with top_bar2:
 
 
 def get_project_titles(p_name):
-  cap_in = st.session_state.get(f"t_cap_{p_name}", "").strip()
-  box_in = st.session_state.get(f"t_box_{p_name}", "").strip()
-  ts_in = st.session_state.get(f"t_ts_{p_name}", "").strip()
-  mean_in = st.session_state.get(f"t_mean_{p_name}", "").strip()
+  """严格按输入框当前值生成标题；若用户主动留空，则回退该项目的默认标准后缀"""
+  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
+  k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(p_name)
+  v_cap = str(st.session_state.get(k_cap, "")).strip()
+  v_box = str(st.session_state.get(k_box, "")).strip()
+  v_ts = str(st.session_state.get(k_ts, "")).strip()
+  v_mean = str(st.session_state.get(k_mean, "")).strip()
   return (
-      cap_in if cap_in else f"{p_name} — Process Capability Report",
-      box_in if box_in else f"{p_name} — Box Plot",
-      ts_in if ts_in else f"{p_name} — Time Series Plot",
-      mean_in if mean_in else f"{p_name}均值",
+      v_cap if v_cap else d_cap,
+      v_box if v_box else d_box,
+      v_ts if v_ts else d_ts,
+      v_mean if v_mean else d_mean,
   )
 
 
