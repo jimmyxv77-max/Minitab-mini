@@ -453,7 +453,7 @@ def render_landing_page():
               </p>
               <ul style="font-size:13.5px;line-height:1.75;padding-left:18px;margin-bottom:0;">
                 <li>单文件多项目分组、自定义比例（4:3 / 16:9 / 2.2:1 等）</li>
-                <li>过程能力报告（CPK/PPK）、分组箱线图、时间序列图、单行均值趋势图</li>
+                <li>过程能力报告（CPK/PPK）、分组箱线图、时间序列图、散点序列图、单行均值趋势图</li>
                 <li>支持单点极端尖峰屏蔽与西格玛 / CPK 波动校准</li>
               </ul>
             </div>
@@ -739,6 +739,16 @@ def run_v1_app():
     draft_specs_map[p_key][field_name] = float(st.session_state[widget_key])
     st.session_state["v1_spec_dirty"] = True
 
+  def _reestimate_v1_spec_callback(
+      f_key, l_key, t_key, u_key, df_ref, cols_ref, sp_ref
+  ):
+    rl, rt, ru = compute_recommended_spec(df_ref, cols_ref, sp_ref)
+    draft_specs_map[f_key] = {"lsl": rl, "target": rt, "usl": ru}
+    st.session_state[l_key] = rl
+    st.session_state[t_key] = rt
+    st.session_state[u_key] = ru
+    st.session_state["v1_spec_dirty"] = True
+
   generate_clicked = st.sidebar.button(
       "🚀 生成 / 更新所选项目图表",
       key=f"v1_btn_gen_charts_{dataset_key}",
@@ -807,9 +817,12 @@ def run_v1_app():
   tgt_w_key = f"v1_num_target_{focus_key}"
   usl_w_key = f"v1_num_usl_{focus_key}"
 
+  st.session_state.setdefault(lsl_w_key, float(cur_draft_spec["lsl"]))
+  st.session_state.setdefault(tgt_w_key, float(cur_draft_spec["target"]))
+  st.session_state.setdefault(usl_w_key, float(cur_draft_spec["usl"]))
+
   sc1.number_input(
       "LSL",
-      value=float(cur_draft_spec["lsl"]),
       format="%.4f",
       key=lsl_w_key,
       on_change=_sync_draft_spec,
@@ -817,7 +830,6 @@ def run_v1_app():
   )
   sc2.number_input(
       "Target",
-      value=float(cur_draft_spec["target"]),
       format="%.4f",
       key=tgt_w_key,
       on_change=_sync_draft_spec,
@@ -825,7 +837,6 @@ def run_v1_app():
   )
   sc3.number_input(
       "USL",
-      value=float(cur_draft_spec["usl"]),
       format="%.4f",
       key=usl_w_key,
       on_change=_sync_draft_spec,
@@ -840,20 +851,21 @@ def run_v1_app():
   if st.session_state.get("v1_spec_dirty", False):
     st.sidebar.info("SPEC 已修改待生效：请点击上方「🚀 生成 / 更新所选项目图表」")
 
-  if st.sidebar.button(
+  st.sidebar.button(
       f"🔄 重新自动估算 [{current_focus_proj}] SPEC",
       key=f"v1_btn_reest_spec_{focus_key}",
+      on_click=_reestimate_v1_spec_callback,
+      args=(
+          focus_key,
+          lsl_w_key,
+          tgt_w_key,
+          usl_w_key,
+          df_raw,
+          proj_map[current_focus_proj],
+          spec_info,
+      ),
       use_container_width=True,
-  ):
-    rl, rt, ru = compute_recommended_spec(
-        df_raw, proj_map[current_focus_proj], spec_info
-    )
-    draft_specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
-    st.session_state[lsl_w_key] = rl
-    st.session_state[tgt_w_key] = rt
-    st.session_state[usl_w_key] = ru
-    st.session_state["v1_spec_dirty"] = True
-    st.rerun()
+  )
 
   if len(confirmed_projects) > 1:
     with st.sidebar.expander("📋 批量查看/修改全部已生成项目 SPEC", expanded=False):
@@ -865,9 +877,11 @@ def run_v1_app():
         bl_k = f"v1_batch_lsl_{pk}"
         bt_k = f"v1_batch_tgt_{pk}"
         bu_k = f"v1_batch_usl_{pk}"
+        st.session_state.setdefault(bl_k, float(d_sp["lsl"]))
+        st.session_state.setdefault(bt_k, float(d_sp["target"]))
+        st.session_state.setdefault(bu_k, float(d_sp["usl"]))
         b1.number_input(
             "LSL",
-            value=float(d_sp["lsl"]),
             format="%.4f",
             key=bl_k,
             on_change=_sync_draft_spec,
@@ -875,7 +889,6 @@ def run_v1_app():
         )
         b2.number_input(
             "Target",
-            value=float(d_sp["target"]),
             format="%.4f",
             key=bt_k,
             on_change=_sync_draft_spec,
@@ -883,7 +896,6 @@ def run_v1_app():
         )
         b3.number_input(
             "USL",
-            value=float(d_sp["usl"]),
             format="%.4f",
             key=bu_k,
             on_change=_sync_draft_spec,
@@ -1239,20 +1251,23 @@ def run_v1_app():
         f"{p_name} — Process Capability Report",
         f"{p_name} — Box Plot",
         f"{p_name} — Time Series Plot",
+        f"{p_name} — Scatter Series Plot",
         f"{p_name}均值",
     )
 
   def ensure_project_title_keys(p_name):
-    d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
+    d_cap, d_box, d_ts, d_sc, d_mean = default_titles_for_project(p_name)
     k_cap = f"v1_t_cap_{dataset_key}_{p_name}"
     k_box = f"v1_t_box_{dataset_key}_{p_name}"
     k_ts = f"v1_t_ts_{dataset_key}_{p_name}"
+    k_sc = f"v1_t_sc_{dataset_key}_{p_name}"
     k_mean = f"v1_t_mean_{dataset_key}_{p_name}"
     st.session_state.setdefault(k_cap, d_cap)
     st.session_state.setdefault(k_box, d_box)
     st.session_state.setdefault(k_ts, d_ts)
+    st.session_state.setdefault(k_sc, d_sc)
     st.session_state.setdefault(k_mean, d_mean)
-    return k_cap, k_box, k_ts, k_mean
+    return k_cap, k_box, k_ts, k_sc, k_mean
 
   top_bar1, top_bar2 = st.columns([3.5, 1.2])
   with top_bar1:
@@ -1265,24 +1280,28 @@ def run_v1_app():
           options=ready_projects,
           key=f"v1_title_proj_sel_{dataset_key}",
       )
-      k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(title_target_proj)
+      k_cap, k_box, k_ts, k_sc, k_mean = ensure_project_title_keys(
+          title_target_proj
+      )
       t_c1, t_c2 = st.columns(2)
       t_c1.text_input("能力报告标题", key=k_cap)
       t_c2.text_input("箱线图标题", key=k_box)
       t_c3, t_c4 = st.columns(2)
       t_c3.text_input("时间序列图标题", key=k_ts)
-      t_c4.text_input("单行均值图标题", key=k_mean)
+      t_c4.text_input("散点序列图标题", key=k_sc)
+      st.text_input("单行均值图标题", key=k_mean)
 
       if st.button(
           f"↩️ 恢复 [{title_target_proj}] 默认标准后缀标题",
           key=f"v1_reset_titles_{dataset_key}_{title_target_proj}",
       ):
-        d_cap, d_box, d_ts, d_mean = default_titles_for_project(
+        d_cap, d_box, d_ts, d_sc, d_mean = default_titles_for_project(
             title_target_proj
         )
         st.session_state[k_cap] = d_cap
         st.session_state[k_box] = d_box
         st.session_state[k_ts] = d_ts
+        st.session_state[k_sc] = d_sc
         st.session_state[k_mean] = d_mean
         st.rerun()
 
@@ -1294,16 +1313,18 @@ def run_v1_app():
     )
 
   def get_project_titles(p_name):
-    d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
-    k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(p_name)
+    d_cap, d_box, d_ts, d_sc, d_mean = default_titles_for_project(p_name)
+    k_cap, k_box, k_ts, k_sc, k_mean = ensure_project_title_keys(p_name)
     v_cap = str(st.session_state.get(k_cap, "")).strip()
     v_box = str(st.session_state.get(k_box, "")).strip()
     v_ts = str(st.session_state.get(k_ts, "")).strip()
+    v_sc = str(st.session_state.get(k_sc, "")).strip()
     v_mean = str(st.session_state.get(k_mean, "")).strip()
     return (
         v_cap if v_cap else d_cap,
         v_box if v_box else d_box,
         v_ts if v_ts else d_ts,
+        v_sc if v_sc else d_sc,
         v_mean if v_mean else d_mean,
     )
 
@@ -1773,6 +1794,109 @@ def run_v1_app():
     plt.tight_layout(pad=1.0)
     return save_fig_with_border(fig, show_outer_border, use_tight=True)
 
+  def render_scatter_series_plot(
+      b,
+      title_str,
+      w_in,
+      h_in,
+      x_mode_opt,
+      y_mode_opt,
+      ymin_val=None,
+      ymax_val=None,
+      point_size=None,
+  ):
+    """多通道散点序列图：仅绘制各通道散点（不连折线），适合大样本下清晰观察"""
+    fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+    df_c = b["df_clean"]
+    p_cols = b["cols"]
+    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+    if x_mode_opt == "保留原始表格行号 (Row Index)":
+      x_seq = df_c["Row_Index"].to_numpy(dtype=int)
+      x_label_text = "Original Row Index"
+    else:
+      x_seq = np.arange(1, len(df_c) + 1)
+      x_label_text = "Filtered Sequence Index (1..N)"
+
+    n_pts = len(x_seq)
+    if point_size is None:
+      if n_pts > 5000:
+        pt_s = 4.5
+      elif n_pts > 1500:
+        pt_s = 7.0
+      else:
+        pt_s = 11.0
+    else:
+      pt_s = float(point_size)
+
+    markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
+    cmap = plt.get_cmap("tab20")
+
+    for idx, col_name in enumerate(p_cols):
+      y_col = df_c[col_name].to_numpy(dtype=float)
+      ax.scatter(
+          x_seq,
+          y_col,
+          color=cmap(idx % 20),
+          marker=markers[idx % len(markers)],
+          s=pt_s,
+          alpha=0.72,
+          edgecolors="none",
+          label=str(col_name),
+      )
+
+    ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
+    ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+    ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
+
+    if (
+        y_mode_opt == "自定义范围 (Manual)"
+        and ymin_val is not None
+        and ymax_val is not None
+        and ymin_val < ymax_val
+    ):
+      ax.set_ylim(ymin_val, ymax_val)
+
+    width_scale = min(w_in / 11.0, 1.15)
+    ax.set_title(
+        title_str,
+        fontsize=max(11.5, 13.5 * width_scale),
+        fontweight="bold",
+        pad=12,
+        fontproperties=FONT_PROP,
+    )
+    ax.set_xlabel(x_label_text, fontsize=10)
+    ax.set_ylabel("Value", fontsize=10)
+    ax.grid(True, ls=":", alpha=0.45)
+
+    handles, labels_sc = ax.get_legend_handles_labels()
+    if w_in / h_in < 1.55:
+      n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
+      ax.legend(
+          handles[:20],
+          labels_sc[:20],
+          loc="upper center",
+          bbox_to_anchor=(0.5, -0.15),
+          ncol=n_cols_leg,
+          prop=FONT_PROP,
+          fontsize=7.6,
+          frameon=True,
+      )
+    else:
+      leg = ax.legend(
+          handles[:20],
+          labels_sc[:20],
+          title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
+          bbox_to_anchor=(1.02, 1),
+          loc="upper left",
+          prop=FONT_PROP,
+          fontsize=8.0,
+      )
+      leg.get_title().set_fontsize(8.8)
+
+    plt.tight_layout(pad=1.0)
+    return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
   def render_excel_style_row_mean_plot(
       b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
   ):
@@ -1908,7 +2032,7 @@ def run_v1_app():
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
       for p_name in ready_projects:
         b = project_bundles[p_name]
-        t_cap, t_box, t_ts, t_mean = get_project_titles(p_name)
+        t_cap, t_box, t_ts, t_sc, t_mean = get_project_titles(p_name)
         safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
         zf.writestr(
             f"{safe_p}/{safe_p}_CPK.png",
@@ -1922,6 +2046,12 @@ def run_v1_app():
             f"{safe_p}/{safe_p}_TimeSeries.png",
             render_time_series_plot(
                 b, t_ts, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
+            ).getvalue(),
+        )
+        zf.writestr(
+            f"{safe_p}/{safe_p}_ScatterSeries.png",
+            render_scatter_series_plot(
+                b, t_sc, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
             ).getvalue(),
         )
         zf.writestr(
@@ -1944,17 +2074,18 @@ def run_v1_app():
   for p_tab, p_name in zip(proj_tabs, ready_projects):
     with p_tab:
       b = project_bundles[p_name]
-      t_cap, t_box, t_ts, t_mean = get_project_titles(p_name)
+      t_cap, t_box, t_ts, t_sc, t_mean = get_project_titles(p_name)
       safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", p_name)
       all_v = b["all_valid_vals"]
       p_lsl, p_usl = b["lsl"], b["usl"]
 
-      tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
+      tab_cap, tab_box, tab_ts, tab_sc, tab_mean, tab_data = st.tabs([
           "1️⃣ 过程能力报告 (CPK)",
           "2️⃣ 分组箱线图 (Box Plot)",
           "3️⃣ 多通道时间序列图 (Time Series)",
-          "4️⃣ 单行均值趋势图 (Excel 风格)",
-          "5️⃣ 清洗后数据明细与导出",
+          "4️⃣ 多通道散点序列图 (Scatter Series)",
+          "5️⃣ 单行均值趋势图 (Excel 风格)",
+          "6️⃣ 清洗后数据明细与导出",
       ])
 
       with tab_cap:
@@ -2054,6 +2185,68 @@ def run_v1_app():
             buf_ts,
             f"{safe_prefix}_TimeSeries.png",
             f"v1_ts_{dataset_key}_{p_name}",
+        )
+
+      with tab_sc:
+        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(
+            [1.5, 1.3, 0.85, 0.85, 0.9, 1.4]
+        )
+        sc_x_mode = sc1.selectbox(
+            "X轴序号",
+            options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
+            index=0,
+            key=f"v1_sc_x_{dataset_key}_{p_name}",
+        )
+        sc_y_mode = sc2.selectbox(
+            "Y轴尺度",
+            options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
+            index=0,
+            key=f"v1_sc_y_{dataset_key}_{p_name}",
+        )
+        d_ymin, d_ymax = float(np.min(all_v)), float(np.max(all_v))
+        pad = max((d_ymax - d_ymin) * 0.1, 0.02)
+        sc_ymin, sc_ymax = None, None
+        if sc_y_mode == "自定义范围 (Manual)":
+          sc_ymin = sc3.number_input(
+              "Y-Min",
+              value=round(d_ymin - pad, 4),
+              format="%.4f",
+              key=f"v1_sc_ymin_{dataset_key}_{p_name}",
+          )
+          sc_ymax = sc4.number_input(
+              "Y-Max",
+              value=round(d_ymax + pad, 4),
+              format="%.4f",
+              key=f"v1_sc_ymax_{dataset_key}_{p_name}",
+          )
+        sc_pt_size = sc5.number_input(
+            "点大小",
+            min_value=1.0,
+            max_value=40.0,
+            value=6.0 if len(all_v) > 3000 else 10.0,
+            step=1.0,
+            key=f"v1_sc_pt_{dataset_key}_{p_name}",
+        )
+        sc_w, sc_h, sc_px = render_aspect_selector(
+            sc6, f"sc_{p_name}", default_idx=3
+        )
+
+        buf_sc = render_scatter_series_plot(
+            b,
+            t_sc,
+            sc_w,
+            sc_h,
+            sc_x_mode,
+            sc_y_mode,
+            sc_ymin,
+            sc_ymax,
+            point_size=sc_pt_size,
+        )
+        st.image(buf_sc, width=sc_px)
+        render_chart_action_bar(
+            buf_sc,
+            f"{safe_prefix}_ScatterSeries.png",
+            f"v1_sc_{dataset_key}_{p_name}",
         )
 
       with tab_mean:
@@ -2420,6 +2613,16 @@ def run_v2_app():
     draft_specs_map[p_key][field_name] = float(st.session_state[widget_key])
     st.session_state["v2_spec_dirty"] = True
 
+  def _reestimate_v2_spec_callback(
+      f_key, l_key, t_key, u_key, b_list_ref, cols_ref, sp_ref
+  ):
+    rl, rt, ru = compute_recommended_spec_multi(b_list_ref, cols_ref, sp_ref)
+    draft_specs_map[f_key] = {"lsl": rl, "target": rt, "usl": ru}
+    st.session_state[l_key] = rl
+    st.session_state[t_key] = rt
+    st.session_state[u_key] = ru
+    st.session_state["v2_spec_dirty"] = True
+
   generate_clicked = st.sidebar.button(
       "🚀 生成 / 更新所选项目图表",
       key=f"v2_btn_gen_charts_{dataset_key}",
@@ -2489,9 +2692,12 @@ def run_v2_app():
   tgt_w_key = f"v2_num_target_{focus_key}"
   usl_w_key = f"v2_num_usl_{focus_key}"
 
+  st.session_state.setdefault(lsl_w_key, float(cur_draft_spec["lsl"]))
+  st.session_state.setdefault(tgt_w_key, float(cur_draft_spec["target"]))
+  st.session_state.setdefault(usl_w_key, float(cur_draft_spec["usl"]))
+
   sc1.number_input(
       "LSL",
-      value=float(cur_draft_spec["lsl"]),
       format="%.4f",
       key=lsl_w_key,
       on_change=_sync_v2_draft_spec,
@@ -2499,7 +2705,6 @@ def run_v2_app():
   )
   sc2.number_input(
       "Target",
-      value=float(cur_draft_spec["target"]),
       format="%.4f",
       key=tgt_w_key,
       on_change=_sync_v2_draft_spec,
@@ -2507,7 +2712,6 @@ def run_v2_app():
   )
   sc3.number_input(
       "USL",
-      value=float(cur_draft_spec["usl"]),
       format="%.4f",
       key=usl_w_key,
       on_change=_sync_v2_draft_spec,
@@ -2522,20 +2726,21 @@ def run_v2_app():
   if st.session_state.get("v2_spec_dirty", False):
     st.sidebar.info("SPEC 已修改待生效：请点击上方「🚀 生成 / 更新所选项目图表」")
 
-  if st.sidebar.button(
+  st.sidebar.button(
       f"🔄 重新自动估算 [{current_focus_proj}] 共用 SPEC",
       key=f"v2_btn_reest_spec_{focus_key}",
+      on_click=_reestimate_v2_spec_callback,
+      args=(
+          focus_key,
+          lsl_w_key,
+          tgt_w_key,
+          usl_w_key,
+          batch_entries,
+          proj_map[current_focus_proj],
+          merged_spec_info,
+      ),
       use_container_width=True,
-  ):
-    rl, rt, ru = compute_recommended_spec_multi(
-        batch_entries, proj_map[current_focus_proj], merged_spec_info
-    )
-    draft_specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
-    st.session_state[lsl_w_key] = rl
-    st.session_state[tgt_w_key] = rt
-    st.session_state[usl_w_key] = ru
-    st.session_state["v2_spec_dirty"] = True
-    st.rerun()
+  )
 
   if len(confirmed_projects) > 1:
     with st.sidebar.expander("📋 批量查看/修改全部共用项目 SPEC", expanded=False):
@@ -2547,9 +2752,11 @@ def run_v2_app():
         bl_k = f"v2_batch_lsl_{pk}"
         bt_k = f"v2_batch_tgt_{pk}"
         bu_k = f"v2_batch_usl_{pk}"
+        st.session_state.setdefault(bl_k, float(d_sp["lsl"]))
+        st.session_state.setdefault(bt_k, float(d_sp["target"]))
+        st.session_state.setdefault(bu_k, float(d_sp["usl"]))
         b1.number_input(
             "LSL",
-            value=float(d_sp["lsl"]),
             format="%.4f",
             key=bl_k,
             on_change=_sync_v2_draft_spec,
@@ -2557,7 +2764,6 @@ def run_v2_app():
         )
         b2.number_input(
             "Target",
-            value=float(d_sp["target"]),
             format="%.4f",
             key=bt_k,
             on_change=_sync_v2_draft_spec,
@@ -2565,7 +2771,6 @@ def run_v2_app():
         )
         b3.number_input(
             "USL",
-            value=float(d_sp["usl"]),
             format="%.4f",
             key=bu_k,
             on_change=_sync_v2_draft_spec,
