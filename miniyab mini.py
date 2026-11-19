@@ -13,16 +13,47 @@ from scipy import stats
 import streamlit as st
 import streamlit.components.v1 as components
 
+APP_VERSION = "v2.0"
+APP_EDITION_TAG = "v2.0 · 多批次对比版"
+
 st.set_page_config(
-    page_title="在线检测 SPC 与过程能力分析系统",
-    page_icon="📈",
+    page_title="在线检测 SPC 与过程能力分析系统 (v2.0 多批次对比)",
+    page_icon="📊",
     layout="wide",
 )
 
 
-def render_app_header():
+def render_app_header(compact=False):
+  """2.0 启动页与主界面顶部统一标识，明显区分于 1.0"""
+  st.markdown(
+      """
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px;">
+          <span style="background:#2563EB;color:#FFFFFF;font-size:12px;font-weight:700;
+                       padding:3px 10px;border-radius:999px;letter-spacing:0.5px;">
+            v2.0 · 多批次对比版
+          </span>
+          <span style="font-size:12px;color:#64748B;">
+            共享项目与 SPEC 设定 · 多批次同屏对比汇报
+          </span>
+        </div>
+        """,
+      unsafe_allow_html=True,
+  )
   st.title("在线检测 SPC 与过程能力分析系统")
-  st.caption("Created by xu")
+  st.caption("Created by xu  |  版本 2.0（多批次联合分析与对比）")
+  if not compact:
+    st.markdown(
+        """
+            <div style="border-left:4px solid #2563EB;background:rgba(37,99,235,0.06);
+                        padding:10px 14px;border-radius:0 8px 8px 0;margin:8px 0 14px 0;font-size:13px;">
+              <strong>2.0 多批次工作流：</strong>
+              1) 在左侧上传 <strong>2–3 个同表头批次文件</strong>；
+              2) 统一配置<strong>待生成项目</strong>与 <strong>SPEC</strong>（修改规格不实时刷新，点按钮统一生效）；
+              3) 保留<strong>单点极端尖峰屏蔽</strong>与<strong>西格玛/CPK 校准</strong>，快速对比各批次表现，挑出最适合汇报的批次。
+            </div>
+            """,
+        unsafe_allow_html=True,
+    )
 
 
 COPY_ICON_SVG = (
@@ -105,7 +136,7 @@ def render_copy_image_button(png_bytes, btn_key):
 
 
 def render_chart_action_bar(png_buf, file_name, key_prefix):
-  """紧凑并排展示「下载」按钮与「复制」图标按钮，消除中间多余留白"""
+  """紧凑并排展示「下载」按钮与「复制」图标按钮"""
   png_bytes = png_buf.getvalue()
   a1, a2, _ = st.columns([0.85, 2.15, 7.0], gap="small")
   with a1:
@@ -181,19 +212,6 @@ else:
 
 plt.rcParams["axes.unicode_minus"] = False
 
-# ==================== 1. 数据源与多项目分组识别 ====================
-st.sidebar.header("1️⃣ 数据源与多项目分组")
-uploaded_file = st.sidebar.file_uploader(
-    "上传检测数据表 (.xlsx / .csv)", type=["xlsx", "xls", "csv"]
-)
-
-if uploaded_file is None:
-  render_app_header()
-  st.info(
-      "👈 请在左侧边栏上传在线检测数据表格（第一行为表头，往下堆叠时间/检测数据）。"
-  )
-  st.stop()
-
 
 def read_csv_compatible(file_bytes):
   """自动兼容 UTF-8 / GB18030 / GBK / Big5 及不同分隔符的 CSV 文件"""
@@ -251,39 +269,21 @@ def load_workbook_sheets(file_bytes, filename):
   return result
 
 
-try:
-  sheets_dict = load_workbook_sheets(
-      uploaded_file.getvalue(), uploaded_file.name
-  )
-except Exception as exc:
-  st.error(f"❌ 文件读取失败，请检查文件格式或编码：{exc}")
-  st.stop()
-
-selected_sheet = st.sidebar.selectbox(
-    "工作表 (Sheet)", list(sheets_dict.keys())
-)
-df_raw = sheets_dict[selected_sheet].copy()
-df_raw = df_raw.dropna(how="all").reset_index(drop=True)
-
-if df_raw.empty:
-  st.error("所选工作表无有效数据，请检查表格内容。")
-  st.stop()
-
-df_raw.insert(0, "Row_Index", np.arange(1, len(df_raw) + 1))
-
-numeric_cols_all = []
-for col in df_raw.columns:
-  if col == "Row_Index":
-    continue
-  converted = pd.to_numeric(df_raw[col], errors="coerce")
-  non_null = df_raw[col].notna().sum()
-  if non_null > 0 and converted.notna().sum() / non_null >= 0.3:
-    df_raw[col] = converted
-    numeric_cols_all.append(col)
-
-if not numeric_cols_all:
-  st.error("未识别到有效的数值型检测列，请检查表格格式（需第1行为表头）。")
-  st.stop()
+def prepare_clean_raw_df(raw_sheet_df):
+  df_w = raw_sheet_df.dropna(how="all").reset_index(drop=True).copy()
+  if df_w.empty:
+    return None, []
+  df_w.insert(0, "Row_Index", np.arange(1, len(df_w) + 1))
+  num_cols = []
+  for col in df_w.columns:
+    if col == "Row_Index":
+      continue
+    converted = pd.to_numeric(df_w[col], errors="coerce")
+    non_null = df_w[col].notna().sum()
+    if non_null > 0 and converted.notna().sum() / non_null >= 0.3:
+      df_w[col] = converted
+      num_cols.append(col)
+  return df_w, num_cols
 
 
 def detect_spec_from_columns(df, all_cols):
@@ -333,16 +333,7 @@ def detect_spec_from_columns(df, all_cols):
   }
 
 
-spec_info = detect_spec_from_columns(df_raw, df_raw.columns)
-measurement_candidates = [
-    c for c in numeric_cols_all if c not in spec_info["spec_cols"]
-]
-if not measurement_candidates:
-  measurement_candidates = numeric_cols_all
-
-
 def is_likely_non_measurement(name_str):
-  """识别常见非质量检测数值列（日期、时间、编号、EA号、速度、走带距离、OK/NG统计等）"""
   s = str(name_str).strip().lower()
   non_meas_tokens = [
       "日期",
@@ -373,7 +364,6 @@ def is_likely_non_measurement(name_str):
 
 
 def infer_parameter_groups(cols):
-  """按列名末尾数字/分隔符自动聚合成参数组（如 涂宽1..5 -> 涂宽）"""
   groups = {}
   order = []
   for c in cols:
@@ -388,87 +378,189 @@ def infer_parameter_groups(cols):
   return order, groups
 
 
+# ==================== 1. 多批次数据源（建议 2-3 个同表头批次文件） ====================
+st.sidebar.header("1️⃣ 多批次数据源（2-3个批次）")
+uploaded_files = st.sidebar.file_uploader(
+    "上传 2–3 个批次检测数据表 (.xlsx / .csv)",
+    type=["xlsx", "xls", "csv"],
+    accept_multiple_files=True,
+    help="建议同时选择 2–3 个表头一致的批次文件，系统将自动共用项目、SPEC 与屏蔽/校准设定进行对比。",
+)
+
+if not uploaded_files or len(uploaded_files) < 2:
+  render_app_header(compact=False)
+  if not uploaded_files:
+    st.info(
+        "👈 请在左侧边栏上传 **2–3 个批次**的检测数据表格（建议表头相同，便于共用项目与 SPEC 设定）。"
+    )
+  else:
+    st.warning(
+        f"当前仅上传了 1 个文件（{uploaded_files[0].name}）。2.0 多批次对比版建议同时上传 **2–3 个批次文件**进行对比；请继续添加批次文件。"
+    )
+  st.stop()
+
+if len(uploaded_files) > 3:
+  st.sidebar.caption(
+      f"已上传 {len(uploaded_files)} 个批次文件，当前将全部纳入多批次对比。"
+  )
+
+batch_entries = []
+for f_idx, up_file in enumerate(uploaded_files):
+  try:
+    s_dict = load_workbook_sheets(up_file.getvalue(), up_file.name)
+  except Exception as exc:
+    st.error(f"❌ 批次文件 [{up_file.name}] 读取失败：{exc}")
+    st.stop()
+  sheet_names = list(s_dict.keys())
+  default_sh_idx = 0
+  chosen_sheet = st.sidebar.selectbox(
+      f"批次 {f_idx + 1} 工作表 ({up_file.name})",
+      options=sheet_names,
+      index=default_sh_idx,
+      key=f"v2_sheet_{f_idx}_{up_file.name}",
+  )
+  df_clean_raw, num_cols = prepare_clean_raw_df(s_dict[chosen_sheet])
+  if df_clean_raw is None or not num_cols:
+    st.error(
+        f"❌ 批次 [{up_file.name} - {chosen_sheet}] 未识别到有效数值检测列。"
+    )
+    st.stop()
+
+  batch_label = f"批次{f_idx + 1}: {os.path.splitext(up_file.name)[0]}"
+  # 若有重名批次标签，追加序号保证唯一
+  if any(b["label"] == batch_label for b in batch_entries):
+    batch_label = f"{batch_label} (#{f_idx + 1})"
+
+  batch_entries.append({
+      "idx": f_idx,
+      "file_name": up_file.name,
+      "sheet": chosen_sheet,
+      "label": batch_label,
+      "df_raw": df_clean_raw,
+      "numeric_cols": num_cols,
+      "spec_info": detect_spec_from_columns(df_clean_raw, df_clean_raw.columns),
+  })
+
+# 计算各批次公共数值列（若表头完全一致，则全部数值列都在交集中）
+common_numeric_cols = [
+    c
+    for c in batch_entries[0]["numeric_cols"]
+    if all(c in b["numeric_cols"] for b in batch_entries[1:])
+]
+union_numeric_cols = []
+for b in batch_entries:
+  for c in b["numeric_cols"]:
+    if c not in union_numeric_cols:
+      union_numeric_cols.append(c)
+
+shared_pool_cols = (
+    common_numeric_cols if common_numeric_cols else union_numeric_cols
+)
+if not common_numeric_cols:
+  st.sidebar.warning(
+      "⚠️ 各批次数值表头不完全一致，已自动取并集列，请核对各项目通道列。"
+  )
+
+# 首选从首个含 SPEC 列的批次提取默认 SPEC
+merged_spec_info = {"lsl": None, "target": None, "usl": None, "spec_cols": set()}
+for b in batch_entries:
+  for k_sp in ("lsl", "target", "usl"):
+    if merged_spec_info[k_sp] is None and b["spec_info"][k_sp] is not None:
+      merged_spec_info[k_sp] = b["spec_info"][k_sp]
+  merged_spec_info["spec_cols"].update(b["spec_info"]["spec_cols"])
+
+measurement_candidates = [
+    c for c in shared_pool_cols if c not in merged_spec_info["spec_cols"]
+]
+if not measurement_candidates:
+  measurement_candidates = shared_pool_cols
+
 group_order, inferred_groups = infer_parameter_groups(measurement_candidates)
 suggested_default_groups = [
     g for g in group_order if not is_likely_non_measurement(g)
 ]
 
-dataset_key = f"{uploaded_file.name}::{selected_sheet}"
-if st.session_state.get("active_dataset_key") != dataset_key:
-  st.session_state["active_dataset_key"] = dataset_key
-  st.session_state["project_groups_map"] = {
+dataset_key = "||".join(
+    f"{b['file_name']}::{b['sheet']}" for b in batch_entries
+)
+
+if st.session_state.get("v2_active_dataset_key") != dataset_key:
+  st.session_state["v2_active_dataset_key"] = dataset_key
+  st.session_state["v2_project_groups_map"] = {
       k: list(v) for k, v in inferred_groups.items()
   }
-  st.session_state["draft_projects"] = list(suggested_default_groups)
-  st.session_state["confirmed_projects"] = list(suggested_default_groups)
-  st.session_state["confirmed_groups_snapshot"] = {
+  st.session_state["v2_draft_projects"] = list(suggested_default_groups)
+  st.session_state["v2_confirmed_projects"] = list(suggested_default_groups)
+  st.session_state["v2_confirmed_groups_snapshot"] = {
       k: list(v) for k, v in inferred_groups.items()
   }
-  st.session_state["selection_dirty"] = False
-  st.session_state["project_specs_map"] = {}
-  st.session_state["draft_specs_map"] = {}
-  st.session_state["spec_dirty"] = False
+  st.session_state["v2_selection_dirty"] = False
+  st.session_state["v2_project_specs_map"] = {}
+  st.session_state["v2_draft_specs_map"] = {}
+  st.session_state["v2_spec_dirty"] = False
 
 proj_map = st.session_state.setdefault(
-    "project_groups_map", {k: list(v) for k, v in inferred_groups.items()}
+    "v2_project_groups_map", {k: list(v) for k, v in inferred_groups.items()}
 )
 available_proj_names = list(proj_map.keys())
 
 draft_default = [
     p
-    for p in st.session_state.get("draft_projects", suggested_default_groups)
+    for p in st.session_state.get(
+        "v2_draft_projects", suggested_default_groups
+    )
     if p in available_proj_names
 ]
 
 selected_projects = st.sidebar.multiselect(
-    "待生成项目 / 参数组（已自动排除日期/编号等列）",
+    "共用待生成项目 / 参数组",
     options=available_proj_names,
     default=draft_default,
-    key=f"ms_draft_projects_{dataset_key}",
-    help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新所选项目图表」，避免误选列拖慢操作。",
+    key=f"v2_ms_draft_projects_{dataset_key}",
+    help="多批次共用同一套项目分组与通道列，选好后点击「🚀 生成 / 更新所选项目图表」。",
 )
-st.session_state["draft_projects"] = selected_projects
+st.session_state["v2_draft_projects"] = selected_projects
 
 cols_changed_in_expander = False
-with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=False):
+with st.sidebar.expander("🔧 调整各项目共用的通道列", expanded=False):
   for p_name in available_proj_names:
     updated_cols = st.multiselect(
         f"[{p_name}] 通道列",
-        options=numeric_cols_all,
-        default=[c for c in proj_map[p_name] if c in numeric_cols_all],
-        key=f"cols_for_{dataset_key}_{p_name}",
+        options=shared_pool_cols,
+        default=[c for c in proj_map[p_name] if c in shared_pool_cols],
+        key=f"v2_cols_for_{dataset_key}_{p_name}",
     )
     if updated_cols and updated_cols != proj_map[p_name]:
       proj_map[p_name] = updated_cols
       cols_changed_in_expander = True
 
   new_grp_name = st.text_input(
-      "新增自定义项目组名称",
+      "新增共用项目组名称",
       value="",
       placeholder="例如: 涂宽+白边对比",
-      key=f"new_grp_name_{dataset_key}",
+      key=f"v2_new_grp_name_{dataset_key}",
   )
   new_grp_cols = st.multiselect(
       "选择新增项目组通道列",
-      options=numeric_cols_all,
+      options=shared_pool_cols,
       default=[],
-      key=f"new_grp_cols_{dataset_key}",
+      key=f"v2_new_grp_cols_{dataset_key}",
   )
   if st.button(
-      "➕ 添加项目组",
-      key=f"btn_add_grp_{dataset_key}",
+      "➕ 添加共用项目组",
+      key=f"v2_btn_add_grp_{dataset_key}",
       use_container_width=True,
   ):
     if new_grp_name.strip() and new_grp_cols:
       g_clean = new_grp_name.strip()
       proj_map[g_clean] = list(new_grp_cols)
-      if g_clean not in st.session_state["draft_projects"]:
-        st.session_state["draft_projects"].append(g_clean)
-      st.session_state["selection_dirty"] = True
+      if g_clean not in st.session_state["v2_draft_projects"]:
+        st.session_state["v2_draft_projects"].append(g_clean)
+      st.session_state["v2_selection_dirty"] = True
       st.rerun()
 
-prev_confirmed = st.session_state.get("confirmed_projects", [])
-prev_snapshot = st.session_state.get("confirmed_groups_snapshot", {})
+prev_confirmed = st.session_state.get("v2_confirmed_projects", [])
+prev_snapshot = st.session_state.get("v2_confirmed_groups_snapshot", {})
 current_selected_non_empty = [
     p for p in selected_projects if len(proj_map.get(p, [])) > 0
 ]
@@ -481,14 +573,22 @@ if (
     or current_snapshot != prev_snapshot
     or cols_changed_in_expander
 ):
-  st.session_state["selection_dirty"] = True
+  st.session_state["v2_selection_dirty"] = True
 
 
-def compute_recommended_spec(df_src, cols_sel, s_info):
-  """使用中位数与抗差标准差(MAD)估算 SPEC，避免编码器尖峰带偏上下限"""
-  vals = df_src[list(cols_sel)].to_numpy(dtype=float)
-  valid_v = vals[~np.isnan(vals)]
-  if len(valid_v) > 0:
+def compute_recommended_spec_multi(b_list, cols_sel, s_info):
+  """基于多批次样本中位数与 MAD 估算共用 SPEC，避免编码器尖峰带偏上下限"""
+  all_pieces = []
+  for b in b_list:
+    valid_cols = [c for c in cols_sel if c in b["df_raw"].columns]
+    if valid_cols:
+      arr = b["df_raw"][valid_cols].to_numpy(dtype=float)
+      vv = arr[~np.isnan(arr)]
+      if len(vv) > 0:
+        all_pieces.append(vv)
+
+  if all_pieces:
+    valid_v = np.concatenate(all_pieces)
     mid = float(np.median(valid_v))
     mad = float(np.median(np.abs(valid_v - mid)))
     robust_std = mad * 1.4826 if mad > 0 else float(np.std(valid_v, ddof=1))
@@ -511,36 +611,38 @@ def compute_recommended_spec(df_src, cols_sel, s_info):
   return float(rec_lsl), float(rec_target), float(rec_usl)
 
 
-specs_map = st.session_state.setdefault("project_specs_map", {})
-draft_specs_map = st.session_state.setdefault("draft_specs_map", {})
+specs_map = st.session_state.setdefault("v2_project_specs_map", {})
+draft_specs_map = st.session_state.setdefault("v2_draft_specs_map", {})
 
 for p_name in current_selected_non_empty:
   p_key = f"{dataset_key}::{p_name}"
   if p_key not in specs_map:
-    rl, rt, ru = compute_recommended_spec(df_raw, proj_map[p_name], spec_info)
+    rl, rt, ru = compute_recommended_spec_multi(
+        batch_entries, proj_map[p_name], merged_spec_info
+    )
     specs_map[p_key] = {"lsl": rl, "target": rt, "usl": ru}
   if p_key not in draft_specs_map:
     draft_specs_map[p_key] = dict(specs_map[p_key])
 
 
-def _sync_draft_spec(p_key, field_name, widget_key):
+def _sync_v2_draft_spec(p_key, field_name, widget_key):
   draft_specs_map.setdefault(p_key, dict(specs_map.get(p_key, {})))
   draft_specs_map[p_key][field_name] = float(st.session_state[widget_key])
-  st.session_state["spec_dirty"] = True
+  st.session_state["v2_spec_dirty"] = True
 
 
 generate_clicked = st.sidebar.button(
     "🚀 生成 / 更新所选项目图表",
-    key=f"btn_gen_charts_{dataset_key}",
+    key=f"v2_btn_gen_charts_{dataset_key}",
     type="primary",
     use_container_width=True,
 )
 if generate_clicked:
-  st.session_state["confirmed_projects"] = list(current_selected_non_empty)
-  st.session_state["confirmed_groups_snapshot"] = {
+  st.session_state["v2_confirmed_projects"] = list(current_selected_non_empty)
+  st.session_state["v2_confirmed_groups_snapshot"] = {
       p: list(proj_map.get(p, [])) for p in current_selected_non_empty
   }
-  st.session_state["selection_dirty"] = False
+  st.session_state["v2_selection_dirty"] = False
   for p_name in current_selected_non_empty:
     p_key = f"{dataset_key}::{p_name}"
     if p_key in draft_specs_map:
@@ -551,42 +653,42 @@ if generate_clicked:
             "target": float(cand["target"]),
             "usl": float(cand["usl"]),
         }
-  st.session_state["spec_dirty"] = False
+  st.session_state["v2_spec_dirty"] = False
 
-if st.session_state.get("selection_dirty", False):
-  render_app_header()
+if st.session_state.get("v2_selection_dirty", False):
+  render_app_header(compact=True)
   if not current_selected_non_empty:
     st.info(
-        "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目（或展开**「调整各项目包含的通道列」**），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+        "👈 当前未选择任何共用项目。请在左侧**「共用待生成项目 / 参数组」**中选择项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
     )
   else:
     st.warning(
-        f"👈 检测到项目或通道列选择已变更（当前已选 {len(current_selected_non_empty)} 个项目：{', '.join(current_selected_non_empty)}）。已暂停自动出图，请点击左侧 **「🚀 生成 / 更新所选项目图表」** 开始生成。"
+        f"👈 检测到共用项目或通道列选择已变更（当前已选 {len(current_selected_non_empty)} 个项目：{', '.join(current_selected_non_empty)}）。已暂停自动出图，请点击左侧 **「🚀 生成 / 更新所选项目图表」** 开始生成。"
     )
   st.stop()
 
 confirmed_projects = [
     p
-    for p in st.session_state.get("confirmed_projects", [])
+    for p in st.session_state.get("v2_confirmed_projects", [])
     if p in available_proj_names and len(proj_map.get(p, [])) > 0
 ]
 
 if not confirmed_projects:
-  render_app_header()
+  render_app_header(compact=True)
   st.info(
-      "👈 请在左侧**「待生成项目 / 参数组」**中选择至少一个项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+      "👈 请在左侧**「共用待生成项目 / 参数组」**中选择至少一个项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
   )
   st.stop()
 
-# ==================== 2. 各项目 SPEC 规格设定（草稿暂存，点按钮统一更新） ====================
-st.sidebar.header("2️⃣ 各项目 SPEC 规格")
-st.sidebar.caption("修改上下限或目标值时不会实时刷新图表，点上方按钮统一生效")
+# ==================== 2. 共用 SPEC 规格设定（草稿暂存，点按钮统一更新） ====================
+st.sidebar.header("2️⃣ 共用 SPEC 规格设定")
+st.sidebar.caption("多批次共用同一规格；修改时不实时刷新图表，点上方按钮统一生效")
 
 current_focus_proj = st.sidebar.selectbox(
-    "当前编辑 SPEC 的项目",
+    "当前编辑 SPEC 的共用项目",
     options=confirmed_projects,
     index=0,
-    key=f"focus_spec_proj_{dataset_key}",
+    key=f"v2_focus_spec_proj_{dataset_key}",
 )
 focus_key = f"{dataset_key}::{current_focus_proj}"
 cur_draft_spec = draft_specs_map.setdefault(
@@ -594,16 +696,16 @@ cur_draft_spec = draft_specs_map.setdefault(
 )
 
 sc1, sc2, sc3 = st.sidebar.columns(3)
-lsl_w_key = f"num_lsl_{focus_key}"
-tgt_w_key = f"num_target_{focus_key}"
-usl_w_key = f"num_usl_{focus_key}"
+lsl_w_key = f"v2_num_lsl_{focus_key}"
+tgt_w_key = f"v2_num_target_{focus_key}"
+usl_w_key = f"v2_num_usl_{focus_key}"
 
 sc1.number_input(
     "LSL",
     value=float(cur_draft_spec["lsl"]),
     format="%.4f",
     key=lsl_w_key,
-    on_change=_sync_draft_spec,
+    on_change=_sync_v2_draft_spec,
     args=(focus_key, "lsl", lsl_w_key),
 )
 sc2.number_input(
@@ -611,7 +713,7 @@ sc2.number_input(
     value=float(cur_draft_spec["target"]),
     format="%.4f",
     key=tgt_w_key,
-    on_change=_sync_draft_spec,
+    on_change=_sync_v2_draft_spec,
     args=(focus_key, "target", tgt_w_key),
 )
 sc3.number_input(
@@ -619,49 +721,49 @@ sc3.number_input(
     value=float(cur_draft_spec["usl"]),
     format="%.4f",
     key=usl_w_key,
-    on_change=_sync_draft_spec,
+    on_change=_sync_v2_draft_spec,
     args=(focus_key, "usl", usl_w_key),
 )
 
-active_draft_lsl = float(draft_specs_map[focus_key]["lsl"])
-active_draft_usl = float(draft_specs_map[focus_key]["usl"])
-if active_draft_lsl >= active_draft_usl:
+if float(draft_specs_map[focus_key]["lsl"]) >= float(
+    draft_specs_map[focus_key]["usl"]
+):
   st.sidebar.warning(f"⚠️ [{current_focus_proj}] LSL 应小于 USL，生效前请修正。")
 
-if st.session_state.get("spec_dirty", False):
+if st.session_state.get("v2_spec_dirty", False):
   st.sidebar.info("SPEC 已修改待生效：请点击上方「🚀 生成 / 更新所选项目图表」")
 
 if st.sidebar.button(
-    f"🔄 重新自动估算 [{current_focus_proj}] SPEC",
-    key=f"btn_reest_spec_{focus_key}",
+    f"🔄 重新自动估算 [{current_focus_proj}] 共用 SPEC",
+    key=f"v2_btn_reest_spec_{focus_key}",
     use_container_width=True,
 ):
-  rl, rt, ru = compute_recommended_spec(
-      df_raw, proj_map[current_focus_proj], spec_info
+  rl, rt, ru = compute_recommended_spec_multi(
+      batch_entries, proj_map[current_focus_proj], merged_spec_info
   )
   draft_specs_map[focus_key] = {"lsl": rl, "target": rt, "usl": ru}
   st.session_state[lsl_w_key] = rl
   st.session_state[tgt_w_key] = rt
   st.session_state[usl_w_key] = ru
-  st.session_state["spec_dirty"] = True
+  st.session_state["v2_spec_dirty"] = True
   st.rerun()
 
 if len(confirmed_projects) > 1:
-  with st.sidebar.expander("📋 批量查看/修改全部已生成项目 SPEC", expanded=False):
+  with st.sidebar.expander("📋 批量查看/修改全部共用项目 SPEC", expanded=False):
     for p_name in confirmed_projects:
       pk = f"{dataset_key}::{p_name}"
       d_sp = draft_specs_map.setdefault(pk, dict(specs_map[pk]))
       st.caption(f"**{p_name}**")
       b1, b2, b3 = st.columns(3)
-      bl_k = f"batch_lsl_{pk}"
-      bt_k = f"batch_tgt_{pk}"
-      bu_k = f"batch_usl_{pk}"
+      bl_k = f"v2_batch_lsl_{pk}"
+      bt_k = f"v2_batch_tgt_{pk}"
+      bu_k = f"v2_batch_usl_{pk}"
       b1.number_input(
           "LSL",
           value=float(d_sp["lsl"]),
           format="%.4f",
           key=bl_k,
-          on_change=_sync_draft_spec,
+          on_change=_sync_v2_draft_spec,
           args=(pk, "lsl", bl_k),
       )
       b2.number_input(
@@ -669,7 +771,7 @@ if len(confirmed_projects) > 1:
           value=float(d_sp["target"]),
           format="%.4f",
           key=bt_k,
-          on_change=_sync_draft_spec,
+          on_change=_sync_v2_draft_spec,
           args=(pk, "target", bt_k),
       )
       b3.number_input(
@@ -677,11 +779,11 @@ if len(confirmed_projects) > 1:
           value=float(d_sp["usl"]),
           format="%.4f",
           key=bu_k,
-          on_change=_sync_draft_spec,
+          on_change=_sync_v2_draft_spec,
           args=(pk, "usl", bu_k),
       )
 
-# ==================== 3. 全局统一数据屏蔽引擎 ====================
+# ==================== 3. 全局统一样本屏蔽（单点极端尖峰屏蔽 + 行规则） ====================
 st.sidebar.header("3️⃣ 全局样本屏蔽")
 
 active_ref_lsl = float(specs_map[focus_key]["lsl"])
@@ -696,7 +798,7 @@ spike_mode = st.sidebar.selectbox(
         "不启用单点屏蔽",
     ],
     index=0,
-    key=f"spike_mode_{dataset_key}",
+    key=f"v2_spike_mode_{dataset_key}",
     help="专门过滤某行个别通道混入的编码器/传感器错误值，避免拉歪整体均值与箱线图。",
 )
 
@@ -710,13 +812,13 @@ if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
       max_value=200.0,
       value=15.0,
       step=1.0,
-      key=f"mad_mult_{dataset_key}",
+      key=f"v2_mad_mult_{dataset_key}",
   )
   spike_action = sp_c2.selectbox(
       "异常点处理方式",
       options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
       index=0,
-      key=f"sp_act_mad_{dataset_key}",
+      key=f"v2_sp_act_mad_{dataset_key}",
   )
 elif spike_mode == "按各项目 SPEC 公差倍数识别":
   sp_c1, sp_c2 = st.sidebar.columns([1.15, 1.35])
@@ -726,13 +828,13 @@ elif spike_mode == "按各项目 SPEC 公差倍数识别":
       max_value=50.0,
       value=3.0,
       step=0.5,
-      key=f"tol_mult_{dataset_key}",
+      key=f"v2_tol_mult_{dataset_key}",
   )
   spike_action = sp_c2.selectbox(
       "异常点处理方式",
       options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
       index=0,
-      key=f"sp_act_tol_{dataset_key}",
+      key=f"v2_sp_act_tol_{dataset_key}",
   )
 elif spike_mode == "自定义单点有效数值区间":
   sp_c1, sp_c2 = st.sidebar.columns(2)
@@ -740,29 +842,28 @@ elif spike_mode == "自定义单点有效数值区间":
       "单点最小值",
       value=float(active_ref_lsl - (active_ref_usl - active_ref_lsl)),
       format="%.4f",
-      key=f"pt_min_{dataset_key}",
+      key=f"v2_pt_min_{dataset_key}",
   )
   pt_max_val = sp_c2.number_input(
       "单点最大值",
       value=float(active_ref_usl + (active_ref_usl - active_ref_lsl)),
       format="%.4f",
-      key=f"pt_max_{dataset_key}",
+      key=f"v2_pt_max_{dataset_key}",
   )
   spike_action = sp_c2.selectbox(
       "异常点处理方式",
       options=["置空该单元格（保留行内其他列）", "剔除包含异常点的整行"],
       index=0,
-      key=f"sp_act_rng_{dataset_key}",
+      key=f"v2_sp_act_rng_{dataset_key}",
   )
 else:
   spike_action = "置空该单元格（保留行内其他列）"
 
 exclude_ranges_str = st.sidebar.text_input(
-    "屏蔽行号区间（支持多段）",
+    "屏蔽行号区间（支持多段，各批次同步）",
     value="",
     placeholder="例如: 1-250, 600-630",
-    key=f"excl_rows_{dataset_key}",
-    help="剔除指定原始行号范围（1开始），同步作用于全套图表与导出明细。",
+    key=f"v2_excl_rows_{dataset_key}",
 )
 
 
@@ -793,8 +894,6 @@ def parse_exclude_indices(range_text, max_row):
   return excluded
 
 
-excluded_rows_set = parse_exclude_indices(exclude_ranges_str, len(df_raw))
-
 filter_mode = st.sidebar.selectbox(
     "行均值数值筛选规则",
     options=[
@@ -803,7 +902,7 @@ filter_mode = st.sidebar.selectbox(
         "按自定义范围过滤（超出设定区间屏蔽）",
     ],
     index=1,
-    key=f"filter_mode_{dataset_key}",
+    key=f"v2_filter_mode_{dataset_key}",
 )
 
 custom_min, custom_max = None, None
@@ -813,13 +912,13 @@ if filter_mode == "按自定义范围过滤（超出设定区间屏蔽）":
       "允许最小值",
       value=float(active_ref_lsl),
       format="%.4f",
-      key=f"c_min_{dataset_key}",
+      key=f"v2_c_min_{dataset_key}",
   )
   custom_max = c_max.number_input(
       "允许最大值",
       value=float(active_ref_usl),
       format="%.4f",
-      key=f"c_max_{dataset_key}",
+      key=f"v2_c_max_{dataset_key}",
   )
   if custom_min >= custom_max:
     st.sidebar.error("⚠️ 最小值必须小于最大值！")
@@ -843,25 +942,31 @@ def compute_within_std(mat, flat_vals):
   return m_mr / 1.12838 if m_mr > 0 else s_ov
 
 
-# ==================== 左侧最底部：西格玛 / CPK 波动美化校准 ====================
+# ==================== 4. 西格玛 / CPK 波动校准 ====================
 st.sidebar.markdown("---")
 with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
   sigma_target_proj = st.selectbox(
       "校准作用项目",
       options=["当前聚焦项目"] + confirmed_projects,
       index=0,
-      key=f"sig_proj_{dataset_key}",
+      key=f"v2_sig_proj_{dataset_key}",
+  )
+  sigma_target_batch = st.selectbox(
+      "校准作用批次范围",
+      options=["全部对比批次"] + [b["label"] for b in batch_entries],
+      index=0,
+      key=f"v2_sig_batch_{dataset_key}",
   )
   enable_sigma_tuning = st.checkbox(
       "启用西格玛美化校准（全图与导出表同步）",
       value=False,
-      key=f"en_sig_{dataset_key}",
+      key=f"v2_en_sig_{dataset_key}",
   )
   tuning_mode = st.radio(
       "校准方式",
       options=["直接指定目标西格玛 (σ)", "按目标 CPK 自动推算西格玛"],
       index=0,
-      key=f"tun_mode_{dataset_key}",
+      key=f"v2_tun_mode_{dataset_key}",
   )
   center_align_pct = st.slider(
       "均值向 Target 居中比例 (%)",
@@ -869,7 +974,7 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
       max_value=100,
       value=0,
       step=5,
-      key=f"ctr_pct_{dataset_key}",
+      key=f"v2_ctr_pct_{dataset_key}",
   )
   if tuning_mode == "直接指定目标西格玛 (σ)":
     manual_target_sigma = st.number_input(
@@ -877,7 +982,7 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
         min_value=0.000001,
         value=0.020000,
         format="%.6f",
-        key=f"man_sig_{dataset_key}",
+        key=f"v2_man_sig_{dataset_key}",
     )
     target_cpk_goal = 1.33
   else:
@@ -886,14 +991,21 @@ with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
         "目标 CPK 标准",
         options=[1.33, 1.50, 1.67, 2.00],
         index=0,
-        key=f"tgt_cpk_{dataset_key}",
+        key=f"v2_tgt_cpk_{dataset_key}",
     )
 
 
-def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
-  """为单个项目组生成清洗后数据、被剔除行、异常单点统计与西格玛校准结果"""
-  df_w = df_raw.copy()
-  sub_raw = df_w[proj_cols].to_numpy(dtype=float)
+def build_batch_project_dataset(
+    df_src, batch_label, p_name, proj_cols, p_lsl, p_target, p_usl
+):
+  """针对单个批次与单个项目组执行尖峰屏蔽、行过滤、西格玛校准与 SPC 计算"""
+  valid_cols = [c for c in proj_cols if c in df_src.columns]
+  if not valid_cols:
+    return None
+
+  excl_set = parse_exclude_indices(exclude_ranges_str, len(df_src))
+  df_w = df_src.copy()
+  sub_raw = df_w[valid_cols].to_numpy(dtype=float)
   sp_mask = np.zeros_like(sub_raw, dtype=bool)
 
   if spike_mode != "不启用单点屏蔽":
@@ -931,13 +1043,13 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
   if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
     cleaned = sub_raw.copy()
     cleaned[sp_mask] = np.nan
-    for idx_c, c_name in enumerate(proj_cols):
+    for idx_c, c_name in enumerate(valid_cols):
       df_w[c_name] = cleaned[:, idx_c]
 
-  df_w["_Row_Mean_"] = df_w[proj_cols].mean(axis=1)
+  df_w["_Row_Mean_"] = df_w[valid_cols].mean(axis=1)
 
   m_not_nan = df_w["_Row_Mean_"].notna()
-  m_not_rng = ~df_w["Row_Index"].isin(excluded_rows_set)
+  m_not_rng = ~df_w["Row_Index"].isin(excl_set)
   m_no_sp_row = (
       pd.Series(~row_has_sp, index=df_w.index)
       if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
@@ -958,9 +1070,9 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
 
   v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
   df_c = df_w[v_mask].copy().reset_index(drop=True)
-  df_r = df_raw[~v_mask].copy().reset_index(drop=True)
+  df_r = df_src[~v_mask].copy().reset_index(drop=True)
 
-  s_mat_raw = df_c[proj_cols].to_numpy(dtype=float)
+  s_mat_raw = df_c[valid_cols].to_numpy(dtype=float)
   v_vals_raw = s_mat_raw[~np.isnan(s_mat_raw)]
   if len(v_vals_raw) < 2:
     return None
@@ -968,12 +1080,14 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
   orig_m = float(np.mean(v_vals_raw))
   orig_wi = compute_within_std(s_mat_raw, v_vals_raw)
 
-  apply_tuning = enable_sigma_tuning and (
+  proj_match = (
       sigma_target_proj == "当前聚焦项目" and p_name == current_focus_proj
-      or sigma_target_proj == p_name
+  ) or (sigma_target_proj == p_name)
+  batch_match = (sigma_target_batch == "全部对比批次") or (
+      sigma_target_batch == batch_label
   )
 
-  if apply_tuning and orig_wi > 0:
+  if enable_sigma_tuning and proj_match and batch_match and orig_wi > 0:
     adj_mean = orig_m + (p_target - orig_m) * (center_align_pct / 100.0)
     if tuning_mode == "直接指定目标西格玛 (σ)" and manual_target_sigma is not None:
       tgt_wi = float(manual_target_sigma)
@@ -983,11 +1097,11 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
           min_dist / (3.0 * target_cpk_goal) if min_dist > 0 else orig_wi
       )
     ratio = tgt_wi / orig_wi
-    for c_name in proj_cols:
+    for c_name in valid_cols:
       df_c[c_name] = adj_mean + (df_c[c_name] - orig_m) * ratio
-    df_c["_Row_Mean_"] = df_c[proj_cols].mean(axis=1)
+    df_c["_Row_Mean_"] = df_c[valid_cols].mean(axis=1)
 
-  s_mat = df_c[proj_cols].to_numpy(dtype=float)
+  s_mat = df_c[valid_cols].to_numpy(dtype=float)
   v_vals = s_mat[~np.isnan(s_mat)]
   s_mean = float(np.mean(v_vals))
   s_ov = float(np.std(v_vals, ddof=1))
@@ -1025,7 +1139,8 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
   exp_wi_tot = exp_wi_lt + exp_wi_gt
 
   return {
-      "cols": proj_cols,
+      "batch_label": batch_label,
+      "cols": valid_cols,
       "lsl": p_lsl,
       "target": p_target,
       "usl": p_usl,
@@ -1057,108 +1172,71 @@ def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
   }
 
 
-project_bundles = {}
+# bundles[project_name][batch_label] = bundle_dict
+bundles_by_project = {}
 for p_name in confirmed_projects:
   pk = f"{dataset_key}::{p_name}"
   sp = specs_map[pk]
   if sp["lsl"] >= sp["usl"]:
     continue
-  b_data = build_project_dataset(
-      p_name, proj_map[p_name], sp["lsl"], sp["target"], sp["usl"]
-  )
-  if b_data is not None:
-    project_bundles[p_name] = b_data
+  p_batch_map = {}
+  for b_entry in batch_entries:
+    res = build_batch_project_dataset(
+        b_entry["df_raw"],
+        b_entry["label"],
+        p_name,
+        proj_map[p_name],
+        sp["lsl"],
+        sp["target"],
+        sp["usl"],
+    )
+    if res is not None:
+      p_batch_map[b_entry["label"]] = res
+  if p_batch_map:
+    bundles_by_project[p_name] = p_batch_map
 
-if not project_bundles:
+if not bundles_by_project:
   st.error(
-      "当前筛选条件下，所选项目有效数据点不足 2 个或 SPEC 范围无效，请调整后点击「生成 / 更新所选项目图表」。"
+      "当前筛选条件下，各批次有效数据点不足 2 个或 SPEC 无效，请调整后点击「生成 / 更新所选项目图表」。"
   )
   st.stop()
 
-ready_projects = list(project_bundles.keys())
+ready_projects = list(bundles_by_project.keys())
+batch_labels_all = [b["label"] for b in batch_entries]
 
-# ==================== 顶部栏：标题、浅灰外边框开关与多项目一键 ZIP 打包 ====================
-render_app_header()
-
-
-def default_titles_for_project(p_name):
-  return (
-      f"{p_name} — Process Capability Report",
-      f"{p_name} — Box Plot",
-      f"{p_name} — Time Series Plot",
-      f"{p_name}均值",
-  )
-
-
-def ensure_project_title_keys(p_name):
-  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
-  k_cap = f"t_cap_{dataset_key}_{p_name}"
-  k_box = f"t_box_{dataset_key}_{p_name}"
-  k_ts = f"t_ts_{dataset_key}_{p_name}"
-  k_mean = f"t_mean_{dataset_key}_{p_name}"
-  st.session_state.setdefault(k_cap, d_cap)
-  st.session_state.setdefault(k_box, d_box)
-  st.session_state.setdefault(k_ts, d_ts)
-  st.session_state.setdefault(k_mean, d_mean)
-  return k_cap, k_box, k_ts, k_mean
-
+# ==================== 主界面头部、外边框与标题自定义 ====================
+render_app_header(compact=True)
 
 top_bar1, top_bar2 = st.columns([3.5, 1.2])
 with top_bar1:
-  with st.expander(
-      "✏️ 自定义各项目图表主标题（默认保留标准后缀，特殊情况可直接删改）",
-      expanded=False,
-  ):
-    title_target_proj = st.selectbox(
-        "选择要自定义标题的项目",
-        options=ready_projects,
-        key=f"title_proj_sel_{dataset_key}",
+  with st.expander("✏️ 自定义对比图 / 报告主标题", expanded=False):
+    title_proj_sel = st.selectbox(
+        "选择项目", options=ready_projects, key=f"v2_t_proj_{dataset_key}"
     )
-    k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(title_target_proj)
-    t_c1, t_c2 = st.columns(2)
-    t_c1.text_input("能力报告标题", key=k_cap)
-    t_c2.text_input("箱线图标题", key=k_box)
-    t_c3, t_c4 = st.columns(2)
-    t_c3.text_input("时间序列图标题", key=k_ts)
-    t_c4.text_input("单行均值图标题", key=k_mean)
-
-    if st.button(
-        f"↩️ 恢复 [{title_target_proj}] 默认标准后缀标题",
-        key=f"reset_titles_{dataset_key}_{title_target_proj}",
-    ):
-      d_cap, d_box, d_ts, d_mean = default_titles_for_project(title_target_proj)
-      st.session_state[k_cap] = d_cap
-      st.session_state[k_box] = d_box
-      st.session_state[k_ts] = d_ts
-      st.session_state[k_mean] = d_mean
-      st.rerun()
+    k_cmp = f"v2_t_cmp_{dataset_key}_{title_proj_sel}"
+    k_cap = f"v2_t_cap_{dataset_key}_{title_proj_sel}"
+    k_box = f"v2_t_box_{dataset_key}_{title_proj_sel}"
+    k_mean = f"v2_t_mean_{dataset_key}_{title_proj_sel}"
+    st.session_state.setdefault(k_cmp, f"{title_proj_sel} — 多批次过程分布与 CPK 对比")
+    st.session_state.setdefault(k_cap, f"{title_proj_sel} — Process Capability Report")
+    st.session_state.setdefault(k_box, f"{title_proj_sel} — Box Plot")
+    st.session_state.setdefault(k_mean, f"{title_proj_sel}均值对比")
+    c_t1, c_t2 = st.columns(2)
+    c_t1.text_input("多批次分布对比图标题", key=k_cmp)
+    c_t2.text_input("单批次能力报告标题前缀", key=k_cap)
+    c_t3, c_t4 = st.columns(2)
+    c_t3.text_input("箱线图标题前缀", key=k_box)
+    c_t4.text_input("多批次均值趋势图标题", key=k_mean)
 
 with top_bar2:
   show_outer_border = st.checkbox(
       "🖼️ 图像浅灰外边框",
       value=True,
-      key=f"show_border_{dataset_key}",
+      key=f"v2_show_border_{dataset_key}",
       help="为导出图片添加浅灰色矩形边框，方便粘贴至 PPT 多图排版对齐",
   )
 
 
-def get_project_titles(p_name):
-  """严格按输入框当前值生成标题；若用户主动留空，则回退该项目的默认标准后缀"""
-  d_cap, d_box, d_ts, d_mean = default_titles_for_project(p_name)
-  k_cap, k_box, k_ts, k_mean = ensure_project_title_keys(p_name)
-  v_cap = str(st.session_state.get(k_cap, "")).strip()
-  v_box = str(st.session_state.get(k_box, "")).strip()
-  v_ts = str(st.session_state.get(k_ts, "")).strip()
-  v_mean = str(st.session_state.get(k_mean, "")).strip()
-  return (
-      v_cap if v_cap else d_cap,
-      v_box if v_box else d_box,
-      v_ts if v_ts else d_ts,
-      v_mean if v_mean else d_mean,
-  )
-
-
-# ==================== 统一图像浅灰色外边框封装 ====================
 def save_fig_with_border(fig, use_tight=False):
   fig.patch.set_facecolor("white")
   buf = io.BytesIO()
@@ -1215,62 +1293,193 @@ def save_fig_with_border(fig, use_tight=False):
   return buf
 
 
-ASPECT_OPTIONS = [
-    "4 : 3（PPT 多图/四宫格）",
-    "3 : 2（紧凑双图对比）",
-    "16 : 9（宽屏展示）",
-    "2.2 : 1（超宽横幅）",
-    "自定义比例",
-]
+BATCH_COLORS = ["#2563EB", "#D97706", "#059669", "#7C3AED", "#DB2777"]
 
 
-def render_aspect_selector(container_col, key_prefix, default_idx=0):
-  preset = container_col.selectbox(
-      "图像比例",
-      options=ASPECT_OPTIONS,
-      index=default_idx,
-      key=f"{key_prefix}_{dataset_key}_aspect_preset",
+# ==================== 多批次绘图函数 ====================
+def render_multi_batch_comparison_plot(p_name, p_batch_dict, title_str):
+  """左侧多批次正态分布与箱线对比，右侧 CPK / PPK / 均值 / σ 横向对比"""
+  active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
+  first_b = p_batch_dict[active_labels[0]]
+  p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
+
+  fig = plt.figure(figsize=(12.2, 6.2), dpi=170)
+  gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1.25], wspace=0.25)
+  ax_dist = fig.add_subplot(gs[0, 0])
+  ax_kpi = fig.add_subplot(gs[0, 1])
+
+  span = max(p_usl - p_lsl, 1e-6)
+  all_concat = np.concatenate(
+      [p_batch_dict[lbl]["all_valid_vals"] for lbl in active_labels]
   )
-  if preset == "4 : 3（PPT 多图/四宫格）":
-    fw, fh = 9.6, 7.2
-  elif preset == "3 : 2（紧凑双图对比）":
-    fw, fh = 10.5, 7.0
-  elif preset == "16 : 9（宽屏展示）":
-    fw, fh = 12.8, 7.2
-  elif preset == "2.2 : 1（超宽横幅）":
-    fw, fh = 13.6, 6.2
-  else:
-    sub_c1, sub_c2 = container_col.columns(2)
-    rw = sub_c1.number_input(
-        "宽比",
-        min_value=1.0,
-        max_value=30.0,
-        value=4.0,
-        step=0.5,
-        key=f"{key_prefix}_{dataset_key}_rw",
+  x_min = min(p_lsl - 0.15 * span, float(np.min(all_concat)) - 0.05 * span)
+  x_max = max(p_usl + 0.15 * span, float(np.max(all_concat)) + 0.05 * span)
+  x_grid = np.linspace(x_min, x_max, 400)
+
+  for idx, lbl in enumerate(active_labels):
+    b = p_batch_dict[lbl]
+    col = BATCH_COLORS[idx % len(BATCH_COLORS)]
+    s_ov = b["std_overall"]
+    if s_ov > 1e-12:
+      ax_dist.plot(
+          x_grid,
+          stats.norm.pdf(x_grid, b["sample_mean"], s_ov),
+          color=col,
+          lw=2.0,
+          label=f"{lbl} (CPK={b['cpk']:.2f}, μ={b['sample_mean']:.3f})",
+      )
+    ax_dist.axvline(b["sample_mean"], color=col, ls=":", lw=1.1, alpha=0.8)
+
+  ax_dist.axvline(p_lsl, color="#DC2626", ls="--", lw=1.3)
+  ax_dist.axvline(p_usl, color="#DC2626", ls="--", lw=1.3)
+  ax_dist.axvline(p_target, color="#16A34A", ls="-.", lw=1.1)
+
+  y_top = ax_dist.get_ylim()[1]
+  ax_dist.text(
+      p_lsl,
+      y_top * 0.98,
+      f"LSL {p_lsl}",
+      color="#B91C1C",
+      ha="center",
+      va="top",
+      fontsize=8.2,
+      fontweight="bold",
+  )
+  ax_dist.text(
+      p_usl,
+      y_top * 0.98,
+      f"USL {p_usl}",
+      color="#B91C1C",
+      ha="center",
+      va="top",
+      fontsize=8.2,
+      fontweight="bold",
+  )
+  ax_dist.text(
+      p_target,
+      y_top * 0.98,
+      f"Tgt {p_target}",
+      color="#15803D",
+      ha="center",
+      va="top",
+      fontsize=8.2,
+  )
+
+  ax_dist.set_title(
+      "各批次正态分布与中心偏移对比",
+      fontsize=10.5,
+      fontproperties=FONT_PROP,
+  )
+  ax_dist.set_xlabel("测量值", fontsize=9.5, fontproperties=FONT_PROP)
+  ax_dist.set_ylabel("概率密度", fontsize=9.5, fontproperties=FONT_PROP)
+  ax_dist.legend(prop=FONT_PROP, fontsize=8.0, loc="upper left")
+  ax_dist.grid(True, ls=":", alpha=0.45)
+
+  # 右侧 CPK 与 PPK 分组柱状图
+  x_pos = np.arange(len(active_labels))
+  bar_w = 0.34
+  cpk_vals = [p_batch_dict[lbl]["cpk"] for lbl in active_labels]
+  ppk_vals = [p_batch_dict[lbl]["ppk"] for lbl in active_labels]
+
+  bars1 = ax_kpi.bar(
+      x_pos - bar_w / 2,
+      cpk_vals,
+      width=bar_w,
+      color="#2563EB",
+      label="CPK (组内)",
+  )
+  bars2 = ax_kpi.bar(
+      x_pos + bar_w / 2,
+      ppk_vals,
+      width=bar_w,
+      color="#93C5FD",
+      edgecolor="#1D4ED8",
+      label="PPK (整体)",
+  )
+  ax_kpi.axhline(1.33, color="#16A34A", ls="--", lw=1.1, label="基准 1.33")
+  ax_kpi.axhline(1.00, color="#DC2626", ls=":", lw=1.0, label="警戒 1.00")
+
+  for br in list(bars1) + list(bars2):
+    h_val = br.get_height()
+    if np.isfinite(h_val):
+      ax_kpi.text(
+          br.get_x() + br.get_width() / 2,
+          h_val + 0.03,
+          f"{h_val:.2f}",
+          ha="center",
+          va="bottom",
+          fontsize=7.8,
+      )
+
+  ax_kpi.set_xticks(x_pos)
+  ax_kpi.set_xticklabels(
+      [lbl.split(":")[0] for lbl in active_labels],
+      fontsize=8.8,
+      fontproperties=FONT_PROP,
+  )
+  ax_kpi.set_ylim(0, max(1.8, float(np.nanmax(cpk_vals + ppk_vals)) * 1.22))
+  ax_kpi.set_title("各批次过程能力指数对比", fontsize=10.5, fontproperties=FONT_PROP)
+  ax_kpi.legend(prop=FONT_PROP, fontsize=7.6, loc="upper right")
+  ax_kpi.grid(True, axis="y", ls=":", alpha=0.45)
+
+  fig.suptitle(
+      title_str,
+      fontsize=13,
+      fontweight="bold",
+      y=0.98,
+      fontproperties=FONT_PROP,
+  )
+  plt.tight_layout(rect=[0, 0, 1, 0.93])
+  return save_fig_with_border(fig, use_tight=True)
+
+
+def render_multi_batch_mean_trend(p_name, p_batch_dict, title_str):
+  """各批次行均值变化曲线同图对比（按各自有效样本序号 1..N）"""
+  active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
+  first_b = p_batch_dict[active_labels[0]]
+  p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
+
+  fig, ax = plt.subplots(figsize=(12.8, 5.4), dpi=170)
+  max_len = 1
+  for idx, lbl in enumerate(active_labels):
+    y_m = p_batch_dict[lbl]["df_clean"]["_Row_Mean_"].to_numpy(dtype=float)
+    x_s = np.arange(1, len(y_m) + 1)
+    max_len = max(max_len, len(y_m))
+    ax.plot(
+        x_s,
+        y_m,
+        color=BATCH_COLORS[idx % len(BATCH_COLORS)],
+        lw=1.8,
+        alpha=0.88,
+        label=lbl,
     )
-    rh = sub_c2.number_input(
-        "高比",
-        min_value=1.0,
-        max_value=30.0,
-        value=3.0,
-        step=0.5,
-        key=f"{key_prefix}_{dataset_key}_rh",
-    )
-    fh = 7.0
-    fw = float(np.clip(fh * (rw / rh), 6.5, 16.0))
 
-  px_w = int(min(1150, max(620, fw * 85)))
-  return fw, fh, px_w
+  ax.axhline(
+      p_usl, color="#DC2626", ls="--", lw=1.2, label=f"USL ({p_usl})"
+  )
+  ax.axhline(
+      p_target, color="#16A34A", ls="-.", lw=1.1, label=f"Target ({p_target})"
+  )
+  ax.axhline(
+      p_lsl, color="#DC2626", ls="--", lw=1.2, label=f"LSL ({p_lsl})"
+  )
+
+  ax.set_xlim(1, max(2, max_len))
+  ax.set_title(
+      title_str, fontsize=12.5, fontweight="bold", fontproperties=FONT_PROP
+  )
+  ax.set_xlabel(
+      "有效样本序号 (1..N)", fontsize=9.5, fontproperties=FONT_PROP
+  )
+  ax.set_ylabel("行均值", fontsize=9.5, fontproperties=FONT_PROP)
+  ax.grid(True, ls=":", alpha=0.45)
+  ax.legend(prop=FONT_PROP, fontsize=8.2, ncol=min(5, len(active_labels) + 3))
+  plt.tight_layout()
+  return save_fig_with_border(fig, use_tight=True)
 
 
-# ==================== 单项目四张图渲染函数 ====================
-def render_capability_plot(b, title_str, w_in, h_in):
-  fig = plt.figure(figsize=(w_in, h_in), dpi=170)
-  scale_f = min(w_in / 9.6, h_in / 7.2)
-  font_panel = max(7.2, 8.3 * scale_f)
-  font_title = max(11.5, 13.5 * scale_f)
-
+def render_single_batch_capability_plot(b, title_str):
+  fig = plt.figure(figsize=(9.6, 7.2), dpi=170)
   gs = fig.add_gridspec(
       2,
       3,
@@ -1285,7 +1494,6 @@ def render_capability_plot(b, title_str, w_in, h_in):
   ax_bot_left = fig.add_subplot(gs[1, 0])
   ax_bot_mid = fig.add_subplot(gs[1, 1])
   ax_bot_right = fig.add_subplot(gs[1, 2])
-
   for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
     ax_tmp.axis("off")
 
@@ -1310,9 +1518,6 @@ def render_capability_plot(b, title_str, w_in, h_in):
   span = max(p_usl - p_lsl, 1e-6)
   x_min_c = min(p_lsl - 0.18 * span, float(np.min(all_v)) - 0.08 * span)
   x_max_c = max(p_usl + 0.18 * span, float(np.max(all_v)) + 0.08 * span)
-  if abs(x_max_c - x_min_c) < 1e-9:
-    x_min_c -= 1.0
-    x_max_c += 1.0
   x_grid = np.linspace(x_min_c, x_max_c, 500)
 
   line_ov, line_wi = None, None
@@ -1322,7 +1527,6 @@ def render_capability_plot(b, title_str, w_in, h_in):
         stats.norm.pdf(x_grid, s_mean, s_ov),
         color="#B91C1C",
         lw=1.8,
-        ls="-",
         label="Overall",
     )
   if s_wi > 1e-12:
@@ -1348,13 +1552,8 @@ def render_capability_plot(b, title_str, w_in, h_in):
   )
   ax_mid.set_ylim(0, y_peak * 1.14)
   ax_mid.set_yticks([])
-  ax_mid.tick_params(axis="x", labelsize=max(7.5, 8.8 * scale_f))
   ax_mid.grid(True, axis="x", ls=":", alpha=0.45)
-  for sp in ("top", "right", "left", "bottom"):
-    ax_mid.spines[sp].set_color("#CBD5E1")
-    ax_mid.spines[sp].set_linewidth(0.8)
 
-  lbl_sz = max(7.5, 8.5 * scale_f)
   ax_mid.text(
       p_lsl,
       y_peak * 1.16,
@@ -1362,7 +1561,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
       color="#B91C1C",
       ha="center",
       va="bottom",
-      fontsize=lbl_sz,
+      fontsize=8.2,
       fontweight="bold",
   )
   ax_mid.text(
@@ -1372,7 +1571,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
       color="#B91C1C",
       ha="center",
       va="bottom",
-      fontsize=lbl_sz,
+      fontsize=8.2,
       fontweight="bold",
   )
   ax_mid.text(
@@ -1382,21 +1581,14 @@ def render_capability_plot(b, title_str, w_in, h_in):
       color="#15803D",
       ha="center",
       va="bottom",
-      fontsize=lbl_sz,
+      fontsize=8.2,
   )
 
   left_text = (
-      f"Process Data\n"
-      f"----------------------\n"
-      f"LSL          {p_lsl:.4f}\n"
-      f"Target       {p_target:.4f}\n"
-      f"USL          {p_usl:.4f}\n"
-      f"Mean         {s_mean:.4f}\n"
-      f"Sample N     {tot_n}\n"
-      f"Valid Rows   {len(b['df_clean'])}\n"
-      f"Subgroup     {len(b['cols'])}\n"
-      f"StDev(Ov)    {s_ov:.5f}\n"
-      f"StDev(Wi)    {s_wi:.5f}"
+      f"Process Data\n----------------------\n"
+      f"LSL          {p_lsl:.4f}\nTarget       {p_target:.4f}\nUSL          {p_usl:.4f}\n"
+      f"Mean         {s_mean:.4f}\nSample N     {tot_n}\nValid Rows   {len(b['df_clean'])}\n"
+      f"Subgroup     {len(b['cols'])}\nStDev(Ov)    {s_ov:.5f}\nStDev(Wi)    {s_wi:.5f}"
   )
   ax_left.text(
       0.95,
@@ -1405,24 +1597,16 @@ def render_capability_plot(b, title_str, w_in, h_in):
       transform=ax_left.transAxes,
       va="top",
       ha="right",
-      fontsize=font_panel,
+      fontsize=8.2,
       fontfamily="monospace",
       color="#1E293B",
   )
 
   right_text = (
-      f"Overall Capability\n"
-      f"------------------\n"
-      f"Pp        {b['pp']:.2f}\n"
-      f"PPL       {b['ppl']:.2f}\n"
-      f"PPU       {b['ppu']:.2f}\n"
-      f"Ppk       {b['ppk']:.2f}\n\n"
-      f"Potential (Within)\n"
-      f"------------------\n"
-      f"Cp        {b['cp']:.2f}\n"
-      f"CPL       {b['cpl']:.2f}\n"
-      f"CPU       {b['cpu']:.2f}\n"
-      f"Cpk       {b['cpk']:.2f}"
+      f"Overall Capability\n------------------\n"
+      f"Pp        {b['pp']:.2f}\nPPL       {b['ppl']:.2f}\nPPU       {b['ppu']:.2f}\nPpk       {b['ppk']:.2f}\n\n"
+      f"Potential (Within)\n------------------\n"
+      f"Cp        {b['cp']:.2f}\nCPL       {b['cpl']:.2f}\nCPU       {b['cpu']:.2f}\nCpk       {b['cpk']:.2f}"
   )
   ax_right.text(
       0.06,
@@ -1431,7 +1615,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
       transform=ax_right.transAxes,
       va="top",
       ha="left",
-      fontsize=font_panel,
+      fontsize=8.2,
       fontfamily="monospace",
       color="#1E293B",
   )
@@ -1442,10 +1626,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
         handles=handles_leg,
         loc="upper left",
         bbox_to_anchor=(0.04, 0.98),
-        fontsize=font_panel,
-        frameon=True,
-        facecolor="#F8FAFC",
-        edgecolor="#CBD5E1",
+        fontsize=8.2,
     )
 
   ppm_text = (
@@ -1462,7 +1643,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
       transform=ax_bot_mid.transAxes,
       va="top",
       ha="center",
-      fontsize=max(7.0, font_panel * 0.96),
+      fontsize=7.8,
       fontfamily="monospace",
       color="#1E293B",
       bbox=dict(
@@ -1472,7 +1653,7 @@ def render_capability_plot(b, title_str, w_in, h_in):
 
   fig.suptitle(
       title_str,
-      fontsize=font_title,
+      fontsize=13,
       fontweight="bold",
       y=0.96,
       fontproperties=FONT_PROP,
@@ -1481,17 +1662,8 @@ def render_capability_plot(b, title_str, w_in, h_in):
   return save_fig_with_border(fig, use_tight=False)
 
 
-def render_box_plot(
-    b,
-    title_str,
-    w_in,
-    h_in,
-    show_outliers=False,
-    show_median_val=True,
-    show_mean_val=False,
-    decimals=4,
-):
-  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+def render_single_batch_box_plot(b, title_str, show_outliers=False):
+  fig, ax = plt.subplots(figsize=(9.6, 6.4), dpi=170)
   df_c = b["df_clean"]
   p_cols = b["cols"]
   p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
@@ -1500,585 +1672,200 @@ def render_box_plot(
       arr if len(arr) > 0 else np.array([p_target], dtype=float)
       for arr in (df_c[c].dropna().to_numpy(dtype=float) for c in p_cols)
   ]
-  box_labels = [str(c) for c in p_cols]
-  n_boxes = len(box_data)
-  box_width = 0.42 if n_boxes <= 15 else 0.36
-
   ax.boxplot(
       box_data,
-      tick_labels=box_labels,
+      tick_labels=[str(c) for c in p_cols],
       patch_artist=True,
       showfliers=show_outliers,
-      widths=box_width,
+      widths=0.4,
       boxprops=dict(facecolor="#78A2CC", edgecolor="#2B4C7E", linewidth=1.0),
       medianprops=dict(color="#111827", linewidth=1.3),
-      whiskerprops=dict(color="#2B4C7E", linewidth=1.0),
-      capprops=dict(color="#2B4C7E", linewidth=1.0),
-      flierprops=dict(
-          marker="o",
-          markerfacecolor="#DC2626",
-          markeredgecolor="#DC2626",
-          markersize=3.5,
-      ),
   )
-
   ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
-  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+  ax.axhline(p_target, color="#16A34A", ls=":", lw=1.1)
   ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
-
-  width_scale = min(w_in / 11.0, 1.15)
-  label_font_size = (
-      (8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0)) * width_scale
-  )
-  x_offset = box_width * 0.54
-  fmt_str = f"{{:.{decimals}f}}"
-
-  if show_mean_val:
-    means_arr = [float(np.mean(arr)) for arr in box_data]
-    ax.scatter(
-        np.arange(1, n_boxes + 1),
-        means_arr,
-        color="#1D4ED8",
-        edgecolor="white",
-        s=22,
-        zorder=5,
-        label="Mean",
-    )
-
-  y_min_cur, y_max_cur = ax.get_ylim()
-  y_span_cur = max(y_max_cur - y_min_cur, 1e-6)
-
-  for idx, arr in enumerate(box_data):
-    x_pos = (idx + 1) + x_offset
-    med_v = float(np.median(arr))
-    mean_v = float(np.mean(arr))
-
-    if show_median_val and show_mean_val:
-      min_gap = y_span_cur * 0.032
-      y_med_txt = med_v
-      y_mean_txt = mean_v
-      if abs(y_mean_txt - y_med_txt) < min_gap:
-        if y_mean_txt >= y_med_txt:
-          y_mean_txt = med_v + min_gap * 0.6
-          y_med_txt = med_v - min_gap * 0.6
-        else:
-          y_mean_txt = med_v - min_gap * 0.6
-          y_med_txt = med_v + min_gap * 0.6
-
-      ax.text(
-          x_pos,
-          y_med_txt,
-          f"Med:{fmt_str.format(med_v)}",
-          va="center",
-          ha="left",
-          fontsize=label_font_size,
-          color="#1F2937",
-      )
-      ax.text(
-          x_pos,
-          y_mean_txt,
-          f"Avg:{fmt_str.format(mean_v)}",
-          va="center",
-          ha="left",
-          fontsize=label_font_size,
-          color="#1D4ED8",
-      )
-    elif show_median_val:
-      ax.text(
-          x_pos,
-          med_v,
-          fmt_str.format(med_v),
-          va="center",
-          ha="left",
-          fontsize=label_font_size,
-          color="#1F2937",
-      )
-    elif show_mean_val:
-      ax.text(
-          x_pos,
-          mean_v,
-          fmt_str.format(mean_v),
-          va="center",
-          ha="left",
-          fontsize=label_font_size,
-          color="#1D4ED8",
-      )
-
-  if show_median_val or show_mean_val:
-    ax.set_xlim(0.4, n_boxes + 1.05)
-
-  ax_r = ax.twinx()
-  ax_r.set_ylim(ax.get_ylim())
-  ax_r.set_yticks([p_lsl, p_target, p_usl])
-  ax_r.set_yticklabels(
-      [f"{p_lsl}", f"{p_target}", f"{p_usl}"],
-      color="#B91C1C",
-      fontsize=8.8,
-      fontweight="bold",
-  )
-
-  for sp in ("top", "right", "left", "bottom"):
-    ax.spines[sp].set_color("#BFBFBF")
-    ax.spines[sp].set_linewidth(0.8)
-    ax_r.spines[sp].set_visible(False)
-
   ax.set_title(
       title_str,
-      fontsize=max(11.5, 13.5 * width_scale),
+      fontsize=12.5,
       fontweight="bold",
-      pad=12,
+      pad=10,
       fontproperties=FONT_PROP,
   )
-  ax.set_ylabel("Value", fontsize=10)
-  ax.tick_params(
-      axis="x", rotation=45 if len(box_labels) > 5 else 0, labelsize=8.8
-  )
+  ax.tick_params(axis="x", rotation=35 if len(p_cols) > 5 else 0, labelsize=8.5)
   for lbl in ax.get_xticklabels():
     lbl.set_fontproperties(FONT_PROP)
   ax.grid(True, ls=":", alpha=0.45)
-  plt.tight_layout(pad=1.2)
+  plt.tight_layout()
   return save_fig_with_border(fig, use_tight=False)
 
 
-def render_time_series_plot(
-    b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
-):
-  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-  df_c = b["df_clean"]
-  p_cols = b["cols"]
-  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-  if x_mode_opt == "保留原始表格行号 (Row Index)":
-    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
-    x_label_text = "Original Row Index"
-  else:
-    x_seq = np.arange(1, len(df_c) + 1)
-    x_label_text = "Filtered Sequence Index (1..N)"
-
-  markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
-  cmap = plt.get_cmap("tab20")
-  step_mark = max(1, len(x_seq) // 250)
-
-  for idx, col_name in enumerate(p_cols):
-    y_col = df_c[col_name].to_numpy(dtype=float)
-    ax.plot(
-        x_seq,
-        y_col,
-        color=cmap(idx % 20),
-        lw=1.1,
-        marker=markers[idx % len(markers)],
-        markersize=3.2,
-        markevery=step_mark,
-        alpha=0.85,
-        label=str(col_name),
-    )
-
-  ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
-  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
-  ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
-
-  if (
-      y_mode_opt == "自定义范围 (Manual)"
-      and ymin_val is not None
-      and ymax_val is not None
-      and ymin_val < ymax_val
-  ):
-    ax.set_ylim(ymin_val, ymax_val)
-
-  width_scale = min(w_in / 11.0, 1.15)
-  ax.set_title(
-      title_str,
-      fontsize=max(11.5, 13.5 * width_scale),
-      fontweight="bold",
-      pad=12,
-      fontproperties=FONT_PROP,
-  )
-  ax.set_xlabel(x_label_text, fontsize=10)
-  ax.set_ylabel("Value", fontsize=10)
-  ax.grid(True, ls=":", alpha=0.45)
-
-  handles, labels_ts = ax.get_legend_handles_labels()
-  if w_in / h_in < 1.55:
-    n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
-    ax.legend(
-        handles[:20],
-        labels_ts[:20],
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.15),
-        ncol=n_cols_leg,
-        prop=FONT_PROP,
-        fontsize=7.6,
-        frameon=True,
-    )
-  else:
-    leg = ax.legend(
-        handles[:20],
-        labels_ts[:20],
-        title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
-        bbox_to_anchor=(1.02, 1),
-        loc="upper left",
-        prop=FONT_PROP,
-        fontsize=8.0,
-    )
-    leg.get_title().set_fontsize(8.8)
-
-  plt.tight_layout(pad=1.0)
-  return save_fig_with_border(fig, use_tight=True)
-
-
-def render_excel_style_row_mean_plot(
-    b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
-):
-  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-  ax.set_facecolor("white")
-  df_c = b["df_clean"]
-  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-  if x_mode_opt == "保留原始表格行号 (Row Index)":
-    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
-  else:
-    x_seq = np.arange(1, len(df_c) + 1)
-
-  y_mean_series = df_c["_Row_Mean_"].to_numpy(dtype=float)
-
-  ax.plot(
-      x_seq,
-      np.full_like(x_seq, p_target, dtype=float),
-      color="#4472C4",
-      lw=2.5,
-      label="目标值",
-  )
-  ax.plot(
-      x_seq,
-      np.full_like(x_seq, p_usl, dtype=float),
-      color="#ED7D31",
-      lw=2.5,
-      label="规格上限",
-  )
-  ax.plot(
-      x_seq,
-      np.full_like(x_seq, p_lsl, dtype=float),
-      color="#A5A5A5",
-      lw=2.5,
-      label="规格下限",
-  )
-  ax.plot(
-      x_seq,
-      y_mean_series,
-      color="#FFC000",
-      lw=2.2,
-      label="平均值",
-  )
-
-  if (
-      y_mode_opt == "自定义范围 (Manual)"
-      and ymin_val is not None
-      and ymax_val is not None
-      and ymin_val < ymax_val
-  ):
-    ax.set_ylim(ymin_val, ymax_val)
-  else:
-    spec_span = max(p_usl - p_lsl, 1e-6)
-    y_low = min(
-        p_lsl - 0.5 * spec_span,
-        float(np.min(y_mean_series)) - 0.15 * spec_span,
-    )
-    y_high = max(
-        p_usl + 0.25 * spec_span,
-        float(np.max(y_mean_series)) + 0.15 * spec_span,
-    )
-    if abs(y_high - y_low) < 1e-9:
-      y_low -= 1.0
-      y_high += 1.0
-    ax.set_ylim(y_low, y_high)
-
-  if len(x_seq) >= 2 and x_seq[-1] > x_seq[0]:
-    ax.set_xlim(x_seq[0], x_seq[-1])
-
-  if len(x_seq) > 1:
-    n_ticks = max(12, int(w_in * 2.1))
-    tick_step = max(1, len(x_seq) // n_ticks)
-    tick_positions = x_seq[::tick_step]
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(
-        [str(v) for v in tick_positions],
-        rotation=90,
-        fontsize=9.0,
-        color="#595959",
-    )
-
-  ax.tick_params(axis="y", labelsize=9.5, colors="#595959", length=0)
-  ax.tick_params(axis="x", length=0, pad=5)
-
-  ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color="#D9D9D9")
-  ax.xaxis.grid(False)
-  ax.spines["top"].set_visible(False)
-  ax.spines["right"].set_visible(False)
-  ax.spines["left"].set_visible(False)
-  ax.spines["bottom"].set_color("#D9D9D9")
-  ax.spines["bottom"].set_linewidth(0.9)
-
-  width_scale = min(w_in / 10.5, 1.15)
-  ax.set_title(
-      title_str,
-      fontsize=max(13.5, 16.5 * width_scale),
-      fontweight="normal",
-      color="#595959",
-      pad=16,
-      fontproperties=FONT_PROP,
-  )
-
-  leg = ax.legend(
-      loc="upper center",
-      bbox_to_anchor=(0.5, -0.14),
-      ncol=4,
-      frameon=False,
-      prop=FONT_PROP,
-      fontsize=10.5,
-      handlelength=2.2,
-      columnspacing=1.8,
-  )
-  for text in leg.get_texts():
-    text.set_color("#595959")
-
-  plt.tight_layout(pad=1.0)
-  return save_fig_with_border(fig, use_tight=True)
-
-
-# ==================== 多项目汇总表与一键打包 ZIP ====================
-summary_rows = []
+# ==================== 多批次总览对比表 + 一键打包 ZIP ====================
+st.subheader("多批次指标横向对比总览")
+cmp_rows = []
 for p_name in ready_projects:
-  b = project_bundles[p_name]
-  summary_rows.append({
-      "项目组": p_name,
-      "通道数": len(b["cols"]),
-      "有效行数": len(b["df_clean"]),
-      "总样本 N": b["total_n"],
-      "屏蔽异常单点": b["masked_cells"],
-      "LSL": b["lsl"],
-      "Target": b["target"],
-      "USL": b["usl"],
-      "均值": round(b["sample_mean"], 4),
-      "组内σ": round(b["std_within"], 5),
-      "CPK": round(b["cpk"], 2),
-      "PPK": round(b["ppk"], 2),
-  })
-df_summary = pd.DataFrame(summary_rows)
-st.dataframe(df_summary, width="stretch", hide_index=True)
+  for b_lbl in batch_labels_all:
+    b = bundles_by_project[p_name].get(b_lbl)
+    if b is None:
+      continue
+    cmp_rows.append({
+        "项目组": p_name,
+        "批次": b_lbl,
+        "有效行数": len(b["df_clean"]),
+        "总样本 N": b["total_n"],
+        "屏蔽单点": b["masked_cells"],
+        "LSL": b["lsl"],
+        "Target": b["target"],
+        "USL": b["usl"],
+        "均值": round(b["sample_mean"], 4),
+        "组内σ": round(b["std_within"], 5),
+        "CPK": round(b["cpk"], 2),
+        "PPK": round(b["ppk"], 2),
+        "实测PPM": round(b["obs_total"], 1),
+    })
 
-if len(ready_projects) > 1:
-  zip_buf = io.BytesIO()
-  with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    for p_name in ready_projects:
-      b = project_bundles[p_name]
-      t_cap, t_box, t_ts, t_mean = get_project_titles(p_name)
-      safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
+st.dataframe(pd.DataFrame(cmp_rows), width="stretch", hide_index=True)
+
+zip_buf = io.BytesIO()
+with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+  for p_name in ready_projects:
+    safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
+    t_cmp = str(
+        st.session_state.get(
+            f"v2_t_cmp_{dataset_key}_{p_name}", f"{p_name} — 多批次对比"
+        )
+    )
+    zf.writestr(
+        f"{safe_p}/{safe_p}_多批次分布与CPK对比.png",
+        render_multi_batch_comparison_plot(
+            p_name, bundles_by_project[p_name], t_cmp
+        ).getvalue(),
+    )
+    for b_lbl, b_obj in bundles_by_project[p_name].items():
+      safe_b = re.sub(r'[\\/*?:"<>|]', "_", b_lbl)
       zf.writestr(
-          f"{safe_p}/{safe_p}_CPK.png",
-          render_capability_plot(b, t_cap, 9.6, 7.2).getvalue(),
-      )
-      zf.writestr(
-          f"{safe_p}/{safe_p}_BoxPlot.png",
-          render_box_plot(b, t_box, 9.6, 7.2).getvalue(),
-      )
-      zf.writestr(
-          f"{safe_p}/{safe_p}_TimeSeries.png",
-          render_time_series_plot(
-              b, t_ts, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
+          f"{safe_p}/{safe_b}/{safe_p}_{safe_b}_CPK.png",
+          render_single_batch_capability_plot(
+              b_obj, f"{p_name} [{b_lbl}] — Process Capability Report"
           ).getvalue(),
       )
-      zf.writestr(
-          f"{safe_p}/{safe_p}_RowMean_Trend.png",
-          render_excel_style_row_mean_plot(
-              b, t_mean, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
-          ).getvalue(),
-      )
-  zip_buf.seek(0)
-  safe_sheet = re.sub(r'[\\/*?:"<>|]', "_", selected_sheet)
-  st.download_button(
-      "下载",
-      data=zip_buf,
-      file_name=f"{safe_sheet}_多项目SPC图表包.zip",
-      mime="application/zip",
-      key=f"dl_zip_{dataset_key}",
-  )
+zip_buf.seek(0)
+st.download_button(
+    "下载",
+    data=zip_buf,
+    file_name="v2.0_多批次SPC对比图表包.zip",
+    mime="application/zip",
+    key=f"v2_dl_zip_{dataset_key}",
+)
 
-# ==================== 按项目分标签页展示全套图表与导出 ====================
+# ==================== 按共用项目分标签页展示 ====================
 proj_tabs = st.tabs([f"📊 {p_name}" for p_name in ready_projects])
 
 for p_tab, p_name in zip(proj_tabs, ready_projects):
   with p_tab:
-    b = project_bundles[p_name]
-    t_cap, t_box, t_ts, t_mean = get_project_titles(p_name)
-    safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", p_name)
-    all_v = b["all_valid_vals"]
-    p_lsl, p_usl = b["lsl"], b["usl"]
+    p_batch_map = bundles_by_project[p_name]
+    available_b_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_map]
+    safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
 
-    tab_cap, tab_box, tab_ts, tab_mean, tab_data = st.tabs([
-        "1️⃣ 过程能力报告 (CPK)",
-        "2️⃣ 分组箱线图 (Box Plot)",
-        "3️⃣ 多通道时间序列图 (Time Series)",
-        "4️⃣ 单行均值趋势图 (Excel 风格)",
-        "5️⃣ 清洗后数据明细与导出",
+    t_cmp_default = f"{p_name} — 多批次过程分布与 CPK 对比"
+    t_cap_default = f"{p_name} — Process Capability Report"
+    t_box_default = f"{p_name} — Box Plot"
+    t_mean_default = f"{p_name}均值对比"
+
+    t_cmp = str(
+        st.session_state.get(f"v2_t_cmp_{dataset_key}_{p_name}", t_cmp_default)
+        or t_cmp_default
+    )
+    t_cap_prefix = str(
+        st.session_state.get(f"v2_t_cap_{dataset_key}_{p_name}", t_cap_default)
+        or t_cap_default
+    )
+    t_box_prefix = str(
+        st.session_state.get(f"v2_t_box_{dataset_key}_{p_name}", t_box_default)
+        or t_box_default
+    )
+    t_mean_title = str(
+        st.session_state.get(
+            f"v2_t_mean_{dataset_key}_{p_name}", t_mean_default
+        )
+        or t_mean_default
+    )
+
+    sub_cmp, sub_single, sub_data = st.tabs([
+        "1️⃣ 多批次联合对比图",
+        "2️⃣ 单批次明细图表（逐批检查）",
+        "3️⃣ 各批次清洗明细导出",
     ])
 
-    with tab_cap:
-      cc1, _ = st.columns([1.8, 3.2])
-      cap_w, cap_h, cap_px = render_aspect_selector(
-          cc1, f"cap_{p_name}", default_idx=0
-      )
-      buf_cap = render_capability_plot(b, t_cap, cap_w, cap_h)
-      st.image(buf_cap, width=cap_px)
+    with sub_cmp:
+      buf_cmp = render_multi_batch_comparison_plot(p_name, p_batch_map, t_cmp)
+      st.image(buf_cmp, width=980)
       render_chart_action_bar(
-          buf_cap, f"{safe_prefix}_CPK.png", f"cap_{dataset_key}_{p_name}"
+          buf_cmp, f"{safe_p}_MultiBatch_Compare.png", f"cmp_{dataset_key}_{p_name}"
       )
 
-    with tab_box:
-      bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 1.2, 1.3, 0.9, 1.6])
-      show_box_median = bc1.checkbox(
-          "显示中位数 (Median)",
-          value=True,
-          key=f"bmed_{dataset_key}_{p_name}",
+      st.markdown("---")
+      buf_mt = render_multi_batch_mean_trend(
+          p_name, p_batch_map, t_mean_title
       )
-      show_box_mean = bc2.checkbox(
-          "显示均值 (Mean)", value=False, key=f"bmean_{dataset_key}_{p_name}"
-      )
-      show_box_outliers = bc3.checkbox(
-          "显示异常点 (Outliers)",
-          value=False,
-          key=f"bout_{dataset_key}_{p_name}",
-      )
-      box_decimals = bc4.selectbox(
-          "小数位",
-          options=[2, 3, 4, 5, 6],
-          index=2,
-          key=f"bdec_{dataset_key}_{p_name}",
-      )
-      box_w, box_h, box_px = render_aspect_selector(
-          bc5, f"box_{p_name}", default_idx=0
-      )
-
-      buf_box = render_box_plot(
-          b,
-          t_box,
-          box_w,
-          box_h,
-          show_outliers=show_box_outliers,
-          show_median_val=show_box_median,
-          show_mean_val=show_box_mean,
-          decimals=box_decimals,
-      )
-      st.image(buf_box, width=box_px)
+      st.image(buf_mt, width=1020)
       render_chart_action_bar(
-          buf_box, f"{safe_prefix}_BoxPlot.png", f"box_{dataset_key}_{p_name}"
+          buf_mt,
+          f"{safe_p}_MultiBatch_MeanTrend.png",
+          f"mt_{dataset_key}_{p_name}",
       )
 
-    with tab_ts:
-      tc1, tc2, tc3, tc4, tc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
-      ts_x_mode = tc1.selectbox(
-          "X轴序号",
-          options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
-          index=0,
-          key=f"ts_x_{dataset_key}_{p_name}",
+    with sub_single:
+      chosen_b_lbl = st.selectbox(
+          "选择要查看完整 SPC 图表的批次",
+          options=available_b_labels,
+          key=f"v2_pick_batch_{dataset_key}_{p_name}",
       )
-      ts_y_mode = tc2.selectbox(
-          "Y轴尺度",
-          options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
-          index=0,
-          key=f"ts_y_{dataset_key}_{p_name}",
-      )
-      d_ymin, d_ymax = float(np.min(all_v)), float(np.max(all_v))
-      pad = max((d_ymax - d_ymin) * 0.1, 0.02)
-      ts_ymin, ts_ymax = None, None
-      if ts_y_mode == "自定义范围 (Manual)":
-        ts_ymin = tc3.number_input(
-            "Y-Min",
-            value=round(d_ymin - pad, 4),
-            format="%.4f",
-            key=f"ts_ymin_{dataset_key}_{p_name}",
+      b_cur = p_batch_map[chosen_b_lbl]
+      safe_b = re.sub(r'[\\/*?:"<>|]', "_", chosen_b_lbl)
+
+      sc_left, sc_right = st.columns(2)
+      with sc_left:
+        buf_b_cap = render_single_batch_capability_plot(
+            b_cur, f"{t_cap_prefix} [{chosen_b_lbl}]"
         )
-        ts_ymax = tc4.number_input(
-            "Y-Max",
-            value=round(d_ymax + pad, 4),
-            format="%.4f",
-            key=f"ts_ymax_{dataset_key}_{p_name}",
+        st.image(buf_b_cap, width=640)
+        render_chart_action_bar(
+            buf_b_cap,
+            f"{safe_p}_{safe_b}_CPK.png",
+            f"bcap_{dataset_key}_{p_name}_{chosen_b_lbl}",
         )
-      ts_w, ts_h, ts_px = render_aspect_selector(
-          tc5, f"ts_{p_name}", default_idx=3
-      )
-
-      buf_ts = render_time_series_plot(
-          b, t_ts, ts_w, ts_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
-      )
-      st.image(buf_ts, width=ts_px)
-      render_chart_action_bar(
-          buf_ts,
-          f"{safe_prefix}_TimeSeries.png",
-          f"ts_{dataset_key}_{p_name}",
-      )
-
-    with tab_mean:
-      mc1, mc2, mc3, mc4, mc5 = st.columns([1.6, 1.4, 0.9, 0.9, 1.5])
-      mean_x_mode = mc1.selectbox(
-          "X轴序号",
-          options=["连续重排序号 (1..N，无断层)", "保留原始表格行号 (Row Index)"],
-          index=0,
-          key=f"mean_x_{dataset_key}_{p_name}",
-      )
-      mean_y_mode = mc2.selectbox(
-          "Y轴尺度",
-          options=["自动缩放 (Auto)", "自定义范围 (Manual)"],
-          index=0,
-          key=f"mean_y_{dataset_key}_{p_name}",
-      )
-      mean_ymin, mean_ymax = None, None
-      if mean_y_mode == "自定义范围 (Manual)":
-        spec_span = p_usl - p_lsl
-        mean_ymin = mc3.number_input(
-            "Y-Min",
-            value=round(p_lsl - 0.5 * spec_span, 4),
-            format="%.4f",
-            key=f"mean_ymin_{dataset_key}_{p_name}",
+      with sc_right:
+        show_out_b = st.checkbox(
+            "显示异常点",
+            value=False,
+            key=f"v2_bout_{dataset_key}_{p_name}_{chosen_b_lbl}",
         )
-        mean_ymax = mc4.number_input(
-            "Y-Max",
-            value=round(p_usl + 0.25 * spec_span, 4),
-            format="%.4f",
-            key=f"mean_ymax_{dataset_key}_{p_name}",
+        buf_b_box = render_single_batch_box_plot(
+            b_cur, f"{t_box_prefix} [{chosen_b_lbl}]", show_outliers=show_out_b
         )
-      mean_w, mean_h, mean_px = render_aspect_selector(
-          mc5, f"mean_{p_name}", default_idx=3
-      )
+        st.image(buf_b_box, width=640)
+        render_chart_action_bar(
+            buf_b_box,
+            f"{safe_p}_{safe_b}_Box.png",
+            f"bbox_{dataset_key}_{p_name}_{chosen_b_lbl}",
+        )
 
-      buf_mean = render_excel_style_row_mean_plot(
-          b, t_mean, mean_w, mean_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
-      )
-      st.image(buf_mean, width=mean_px)
-      render_chart_action_bar(
-          buf_mean,
-          f"{safe_prefix}_RowMean_Trend.png",
-          f"mean_{dataset_key}_{p_name}",
-      )
-
-    with tab_data:
+    with sub_data:
       excel_buf = io.BytesIO()
       with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        b["df_clean"].to_excel(writer, sheet_name="Valid_Data", index=False)
-        b["df_removed"].to_excel(
-            writer, sheet_name="Filtered_Out_Rows", index=False
-        )
+        for b_lbl in available_b_labels:
+          sh_name = re.sub(r'[\\/*?:\[\]]', "_", b_lbl)[:31]
+          p_batch_map[b_lbl]["df_clean"].to_excel(
+              writer, sheet_name=sh_name, index=False
+          )
       excel_buf.seek(0)
       st.download_button(
           "下载",
           data=excel_buf,
-          file_name=f"{safe_prefix}_Filtered.xlsx",
+          file_name=f"{safe_p}_各批次有效数据.xlsx",
           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          key=f"dl_xlsx_{dataset_key}_{p_name}",
+          key=f"v2_dl_xlsx_{dataset_key}_{p_name}",
       )
-      sub_t1, sub_t2 = st.tabs(
-          ["有效数据 (Valid)", "被屏蔽异常行 (Filtered Out)"]
-      )
-      with sub_t1:
-        st.dataframe(b["df_clean"], width="stretch")
-      with sub_t2:
-        st.dataframe(b["df_removed"], width="stretch")
+      for b_lbl in available_b_labels:
+        st.caption(f"**{b_lbl}**（有效行：{len(p_batch_map[b_lbl]['df_clean'])}）")
+        st.dataframe(p_batch_map[b_lbl]["df_clean"], width="stretch")
