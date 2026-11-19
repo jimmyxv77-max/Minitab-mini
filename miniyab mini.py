@@ -484,7 +484,7 @@ def render_landing_page():
               </p>
               <ul style="font-size:13.5px;line-height:1.75;padding-left:18px;margin-bottom:0;">
                 <li>多批次共用待生成项目、SPEC 上下限与目标值配置</li>
-                <li>同图对比各批次正态分布偏移、CPK/PPK 柱状图与行均值趋势</li>
+                <li>新增<strong>自定义样本区间</strong>（对齐最短样本或指定起止序号），避免长短不一导致图像参差</li>
                 <li>完整保留单点极端尖峰屏蔽与西格玛 / CPK 波动校准</li>
               </ul>
             </div>
@@ -517,7 +517,9 @@ def render_sidebar_mode_switcher(current_mode):
         unsafe_allow_html=True,
     )
     nav1, nav2 = st.columns(2)
-    if nav1.button("🏠 首页", key=f"go_home_{current_mode}", use_container_width=True):
+    if nav1.button(
+        "🏠 首页", key=f"go_home_{current_mode}", use_container_width=True
+    ):
       st.session_state["app_mode"] = "home"
       st.rerun()
     target_m = "v2" if current_mode == "v1" else "v1"
@@ -545,7 +547,6 @@ def run_v1_app():
     st.title("在线检测 SPC 与过程能力分析系统")
     st.caption("Created by xu")
 
-  # 1. 数据源与多项目分组识别
   st.sidebar.header("1️⃣ 数据源与多项目分组")
   uploaded_file = st.sidebar.file_uploader(
       "上传检测数据表 (.xlsx / .csv)",
@@ -640,7 +641,6 @@ def run_v1_app():
       options=available_proj_names,
       default=draft_default,
       key=f"v1_ms_draft_projects_{dataset_key}",
-      help="先选好需要出图的项目与通道列，再点击下方「生成 / 更新所选项目图表」，避免误选列拖慢操作。",
   )
   st.session_state["v1_draft_projects"] = selected_projects
 
@@ -767,7 +767,7 @@ def run_v1_app():
     render_v1_header()
     if not current_selected_non_empty:
       st.info(
-          "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目（或展开**「调整各项目包含的通道列」**），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
+          "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
       )
     else:
       st.warning(
@@ -788,7 +788,6 @@ def run_v1_app():
     )
     st.stop()
 
-  # 2. 各项目 SPEC 规格设定
   st.sidebar.header("2️⃣ 各项目 SPEC 规格")
   st.sidebar.caption("修改上下限或目标值时不会实时刷新图表，点上方按钮统一生效")
 
@@ -891,7 +890,6 @@ def run_v1_app():
             args=(pk, "usl", bu_k),
         )
 
-  # 3. 全局统一数据屏蔽引擎
   st.sidebar.header("3️⃣ 全局样本屏蔽")
   active_ref_lsl = float(specs_map[focus_key]["lsl"])
   active_ref_usl = float(specs_map[focus_key]["usl"])
@@ -1003,7 +1001,6 @@ def run_v1_app():
       st.sidebar.error("⚠️ 最小值必须小于最大值！")
       st.stop()
 
-  # 西格玛 / CPK 波动美化校准
   st.sidebar.markdown("---")
   with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
     sigma_target_proj = st.selectbox(
@@ -2141,7 +2138,7 @@ def run_v2_app():
                 v2.0 · 多批次对比版
               </span>
               <span style="font-size:12px;color:#64748B;">
-                共享项目与 SPEC 设定 · 多批次同屏对比汇报
+                共享项目与 SPEC 设定 · 自定义样本区间 · 多批次同屏对比汇报
               </span>
             </div>
             """,
@@ -2156,8 +2153,8 @@ def run_v2_app():
                             padding:10px 14px;border-radius:0 8px 8px 0;margin:8px 0 14px 0;font-size:13px;">
                   <strong>2.0 多批次工作流：</strong>
                   1) 在左侧上传 <strong>2–3 个同表头批次文件</strong>；
-                  2) 统一配置<strong>待生成项目</strong>与 <strong>SPEC</strong>（修改规格不实时刷新，点按钮统一生效）；
-                  3) 保留<strong>单点极端尖峰屏蔽</strong>与<strong>西格玛/CPK 校准</strong>，快速对比各批次表现，挑出最适合汇报的批次。
+                  2) 统一配置<strong>待生成项目</strong>、<strong>SPEC</strong> 与<strong>自定义样本区间</strong>（避免样本数不一致导致图像参差）；
+                  3) 保留<strong>单点极端尖峰屏蔽</strong>与<strong>西格玛/CPK 校准</strong>，快速挑出最适合汇报的批次。
                 </div>
                 """,
           unsafe_allow_html=True,
@@ -2185,7 +2182,6 @@ def run_v2_app():
       type=["xlsx", "xls", "csv"],
       accept_multiple_files=True,
       key="v2_uploader",
-      help="建议同时选择 2–3 个表头一致的批次文件，系统将自动共用项目、SPEC 与屏蔽/校准设定进行对比。",
   )
 
   if not uploaded_files or len(uploaded_files) < 2:
@@ -2576,8 +2572,8 @@ def run_v2_app():
             args=(pk, "usl", bu_k),
         )
 
-  # 3. 全局统一样本屏蔽
-  st.sidebar.header("3️⃣ 全局样本屏蔽")
+  # 3. 全局统一样本屏蔽 + 自定义样本区间
+  st.sidebar.header("3️⃣ 全局样本屏蔽与区间")
   active_ref_lsl = float(specs_map[focus_key]["lsl"])
   active_ref_usl = float(specs_map[focus_key]["usl"])
 
@@ -2687,6 +2683,43 @@ def run_v2_app():
       st.sidebar.error("⚠️ 最小值必须小于最大值！")
       st.stop()
 
+  sample_range_mode = st.sidebar.selectbox(
+      "多批次样本区间对齐（防长短不一）",
+      options=[
+          "全部有效样本（默认）",
+          "对齐最短批次样本数（截断到 Min N）",
+          "自定义有效样本序号区间 (Start..End)",
+      ],
+      index=0,
+      key=f"v2_sample_range_mode_{dataset_key}",
+      help="当各批次有效行数不同导致曲线末端参差不齐时，可统一对齐最短批次或指定起止序号区间。",
+  )
+
+  custom_seq_start, custom_seq_end = 1, 500
+  if sample_range_mode == "自定义有效样本序号区间 (Start..End)":
+    sr1, sr2 = st.sidebar.columns(2)
+    custom_seq_start = int(
+        sr1.number_input(
+            "起始序号",
+            min_value=1,
+            value=1,
+            step=10,
+            key=f"v2_seq_start_{dataset_key}",
+        )
+    )
+    custom_seq_end = int(
+        sr2.number_input(
+            "结束序号",
+            min_value=1,
+            value=500,
+            step=50,
+            key=f"v2_seq_end_{dataset_key}",
+        )
+    )
+    if custom_seq_start > custom_seq_end:
+      st.sidebar.error("⚠️ 起始序号不能大于结束序号！")
+      st.stop()
+
   # 4. 西格玛 / CPK 波动校准
   st.sidebar.markdown("---")
   with st.sidebar.expander("⚙️ 西格玛 / CPK 波动校准", expanded=False):
@@ -2739,84 +2772,9 @@ def run_v2_app():
           key=f"v2_tgt_cpk_{dataset_key}",
       )
 
-  def build_batch_project_dataset(
-      df_src, batch_label, p_name, proj_cols, p_lsl, p_target, p_usl
+  def _finalize_bundle_from_df(
+      df_c, df_r, cell_cnt, batch_label, valid_cols, p_name, p_lsl, p_target, p_usl
   ):
-    valid_cols = [c for c in proj_cols if c in df_src.columns]
-    if not valid_cols:
-      return None
-
-    excl_set = parse_exclude_indices(exclude_ranges_str, len(df_src))
-    df_w = df_src.copy()
-    sub_raw = df_w[valid_cols].to_numpy(dtype=float)
-    sp_mask = np.zeros_like(sub_raw, dtype=bool)
-
-    if spike_mode != "不启用单点屏蔽":
-      if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
-        v_flat = sub_raw[~np.isnan(sub_raw)]
-        if len(v_flat) > 0:
-          med_v = float(np.median(v_flat))
-          mad_v = float(np.median(np.abs(v_flat - med_v)))
-          r_sig = mad_v * 1.4826
-          if r_sig <= 1e-12:
-            q75, q25 = np.percentile(v_flat, [75, 25])
-            r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
-          low_b = med_v - spike_param_val * r_sig
-          high_b = med_v + spike_param_val * r_sig
-          sp_mask = (~np.isnan(sub_raw)) & (
-              (sub_raw < low_b) | (sub_raw > high_b)
-          )
-      elif spike_mode == "按各项目 SPEC 公差倍数识别":
-        sp_span = p_usl - p_lsl
-        low_b = p_target - spike_param_val * sp_span
-        high_b = p_target + spike_param_val * sp_span
-        sp_mask = (~np.isnan(sub_raw)) & (
-            (sub_raw < low_b) | (sub_raw > high_b)
-        )
-      elif (
-          spike_mode == "自定义单点有效数值区间"
-          and pt_min_val is not None
-          and pt_max_val is not None
-      ):
-        sp_mask = (~np.isnan(sub_raw)) & (
-            (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
-        )
-
-    cell_cnt = int(np.sum(sp_mask))
-    row_has_sp = np.any(sp_mask, axis=1)
-
-    if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
-      cleaned = sub_raw.copy()
-      cleaned[sp_mask] = np.nan
-      for idx_c, c_name in enumerate(valid_cols):
-        df_w[c_name] = cleaned[:, idx_c]
-
-    df_w["_Row_Mean_"] = df_w[valid_cols].mean(axis=1)
-
-    m_not_nan = df_w["_Row_Mean_"].notna()
-    m_not_rng = ~df_w["Row_Index"].isin(excl_set)
-    m_no_sp_row = (
-        pd.Series(~row_has_sp, index=df_w.index)
-        if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
-        else pd.Series(True, index=df_w.index)
-    )
-    m_val_ok = pd.Series(True, index=df_w.index)
-
-    if filter_mode == "按各项目 SPEC 范围过滤":
-      m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
-    elif (
-        filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
-        and custom_min is not None
-        and custom_max is not None
-    ):
-      m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
-          df_w["_Row_Mean_"] <= custom_max
-      )
-
-    v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
-    df_c = df_w[v_mask].copy().reset_index(drop=True)
-    df_r = df_src[~v_mask].copy().reset_index(drop=True)
-
     s_mat_raw = df_c[valid_cols].to_numpy(dtype=float)
     v_vals_raw = s_mat_raw[~np.isnan(s_mat_raw)]
     if len(v_vals_raw) < 2:
@@ -2916,15 +2874,104 @@ def run_v2_app():
         "exp_wi_total": exp_wi_tot,
     }
 
+  def prefilter_batch_project_df(
+      df_src, batch_label, p_name, proj_cols, p_lsl, p_target, p_usl
+  ):
+    valid_cols = [c for c in proj_cols if c in df_src.columns]
+    if not valid_cols:
+      return None
+
+    excl_set = parse_exclude_indices(exclude_ranges_str, len(df_src))
+    df_w = df_src.copy()
+    sub_raw = df_w[valid_cols].to_numpy(dtype=float)
+    sp_mask = np.zeros_like(sub_raw, dtype=bool)
+
+    if spike_mode != "不启用单点屏蔽":
+      if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
+        v_flat = sub_raw[~np.isnan(sub_raw)]
+        if len(v_flat) > 0:
+          med_v = float(np.median(v_flat))
+          mad_v = float(np.median(np.abs(v_flat - med_v)))
+          r_sig = mad_v * 1.4826
+          if r_sig <= 1e-12:
+            q75, q25 = np.percentile(v_flat, [75, 25])
+            r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
+          low_b = med_v - spike_param_val * r_sig
+          high_b = med_v + spike_param_val * r_sig
+          sp_mask = (~np.isnan(sub_raw)) & (
+              (sub_raw < low_b) | (sub_raw > high_b)
+          )
+      elif spike_mode == "按各项目 SPEC 公差倍数识别":
+        sp_span = p_usl - p_lsl
+        low_b = p_target - spike_param_val * sp_span
+        high_b = p_target + spike_param_val * sp_span
+        sp_mask = (~np.isnan(sub_raw)) & (
+            (sub_raw < low_b) | (sub_raw > high_b)
+        )
+      elif (
+          spike_mode == "自定义单点有效数值区间"
+          and pt_min_val is not None
+          and pt_max_val is not None
+      ):
+        sp_mask = (~np.isnan(sub_raw)) & (
+            (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
+        )
+
+    cell_cnt = int(np.sum(sp_mask))
+    row_has_sp = np.any(sp_mask, axis=1)
+
+    if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
+      cleaned = sub_raw.copy()
+      cleaned[sp_mask] = np.nan
+      for idx_c, c_name in enumerate(valid_cols):
+        df_w[c_name] = cleaned[:, idx_c]
+
+    df_w["_Row_Mean_"] = df_w[valid_cols].mean(axis=1)
+
+    m_not_nan = df_w["_Row_Mean_"].notna()
+    m_not_rng = ~df_w["Row_Index"].isin(excl_set)
+    m_no_sp_row = (
+        pd.Series(~row_has_sp, index=df_w.index)
+        if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
+        else pd.Series(True, index=df_w.index)
+    )
+    m_val_ok = pd.Series(True, index=df_w.index)
+
+    if filter_mode == "按各项目 SPEC 范围过滤":
+      m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
+    elif (
+        filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
+        and custom_min is not None
+        and custom_max is not None
+    ):
+      m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
+          df_w["_Row_Mean_"] <= custom_max
+      )
+
+    v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
+    df_c = df_w[v_mask].copy().reset_index(drop=True)
+    df_r = df_src[~v_mask].copy().reset_index(drop=True)
+    if len(df_c) < 2:
+      return None
+
+    return {
+        "batch_label": batch_label,
+        "valid_cols": valid_cols,
+        "df_clean": df_c,
+        "df_removed": df_r,
+        "masked_cells": cell_cnt,
+    }
+
   bundles_by_project = {}
   for p_name in confirmed_projects:
     pk = f"{dataset_key}::{p_name}"
     sp = specs_map[pk]
     if sp["lsl"] >= sp["usl"]:
       continue
-    p_batch_map = {}
+
+    stage1_map = {}
     for b_entry in batch_entries:
-      res = build_batch_project_dataset(
+      pre = prefilter_batch_project_df(
           b_entry["df_raw"],
           b_entry["label"],
           p_name,
@@ -2933,14 +2980,53 @@ def run_v2_app():
           sp["target"],
           sp["usl"],
       )
-      if res is not None:
-        p_batch_map[b_entry["label"]] = res
+      if pre is not None:
+        stage1_map[b_entry["label"]] = pre
+
+    if not stage1_map:
+      continue
+
+    min_valid_len = min(len(v["df_clean"]) for v in stage1_map.values())
+    p_batch_map = {}
+    for b_lbl, pre in stage1_map.items():
+      df_c_sub = pre["df_clean"].copy()
+      n_cur = len(df_c_sub)
+
+      if sample_range_mode == "对齐最短批次样本数（截断到 Min N）":
+        keep_mask = np.arange(n_cur) < min_valid_len
+      elif sample_range_mode == "自定义有效样本序号区间 (Start..End)":
+        seq_1based = np.arange(1, n_cur + 1)
+        keep_mask = (seq_1based >= custom_seq_start) & (
+            seq_1based <= custom_seq_end
+        )
+      else:
+        keep_mask = np.ones(n_cur, dtype=bool)
+
+      df_c_final = df_c_sub[keep_mask].copy().reset_index(drop=True)
+      df_r_final = pd.concat(
+          [pre["df_removed"], df_c_sub[~keep_mask]], ignore_index=True
+      )
+
+      b_obj = _finalize_bundle_from_df(
+          df_c_final,
+          df_r_final,
+          pre["masked_cells"],
+          b_lbl,
+          pre["valid_cols"],
+          p_name,
+          sp["lsl"],
+          sp["target"],
+          sp["usl"],
+      )
+      if b_obj is not None:
+        p_batch_map[b_lbl] = b_obj
+
     if p_batch_map:
       bundles_by_project[p_name] = p_batch_map
 
   if not bundles_by_project:
     st.error(
-        "当前筛选条件下，各批次有效数据点不足 2 个或 SPEC 无效，请调整后点击「生成 / 更新所选项目图表」。"
+        "当前筛选条件或样本区间下，各批次有效数据点不足 2 个或 SPEC 无效，请调整后重试。"
     )
     st.stop()
 
@@ -3150,7 +3236,7 @@ def run_v2_app():
         title_str, fontsize=12.5, fontweight="bold", fontproperties=FONT_PROP
     )
     ax.set_xlabel(
-        "有效样本序号 (1..N)", fontsize=9.5, fontproperties=FONT_PROP
+        "区间内样本序号 (1..N)", fontsize=9.5, fontproperties=FONT_PROP
     )
     ax.set_ylabel("行均值", fontsize=9.5, fontproperties=FONT_PROP)
     ax.grid(True, ls=":", alpha=0.45)
@@ -3378,6 +3464,8 @@ def run_v2_app():
     return save_fig_with_border(fig, show_outer_border, use_tight=False)
 
   st.subheader("多批次指标横向对比总览")
+  st.caption(f"当前样本区间规则：{sample_range_mode}")
+
   cmp_rows = []
   for p_name in ready_projects:
     for b_lbl in batch_labels_all:
