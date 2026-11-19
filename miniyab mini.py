@@ -12,10 +12,15 @@ from scipy import stats
 import streamlit as st
 
 st.set_page_config(
-    page_title="在线检测 SPC 与过程能力分析系统 (Minitab 风格)",
+    page_title="在线检测 SPC 与过程能力分析系统",
     page_icon="📈",
     layout="wide",
 )
+
+
+def render_app_header():
+  st.title("在线检测 SPC 与过程能力分析系统")
+  st.caption("Created by xu")
 
 
 @st.cache_resource
@@ -85,7 +90,7 @@ uploaded_file = st.sidebar.file_uploader(
 )
 
 if uploaded_file is None:
-  st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+  render_app_header()
   st.info(
       "👈 请在左侧边栏上传在线检测数据表格（第一行为表头，往下堆叠时间/检测数据）。"
   )
@@ -362,7 +367,6 @@ with st.sidebar.expander("🔧 调整各项目包含的通道列", expanded=Fals
       st.session_state["selection_dirty"] = True
       st.rerun()
 
-# 若用户修改了多选项目或通道列，立即标记为待确认，暂停图表自动重绘
 prev_confirmed = st.session_state.get("confirmed_projects", [])
 prev_snapshot = st.session_state.get("confirmed_groups_snapshot", {})
 current_selected_non_empty = [
@@ -393,7 +397,7 @@ if generate_clicked:
   st.session_state["selection_dirty"] = False
 
 if st.session_state.get("selection_dirty", False):
-  st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+  render_app_header()
   if not current_selected_non_empty:
     st.info(
         "👈 当前未选择任何项目。请在左侧**「待生成项目 / 参数组」**中选择项目（或展开**「调整各项目包含的通道列」**），然后点击 **「🚀 生成 / 更新所选项目图表」**。"
@@ -411,7 +415,7 @@ confirmed_projects = [
 ]
 
 if not confirmed_projects:
-  st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+  render_app_header()
   st.info(
       "👈 请在左侧**「待生成项目 / 参数组」**中选择至少一个项目，然后点击 **「🚀 生成 / 更新所选项目图表」**。"
   )
@@ -921,7 +925,7 @@ if not project_bundles:
 ready_projects = list(project_bundles.keys())
 
 # ==================== 顶部栏：标题、浅灰外边框开关与多项目一键 ZIP 打包 ====================
-st.title("📈 在线检测 SPC 与过程能力分析系统（Minitab 风格）")
+render_app_header()
 
 
 def default_titles_for_project(p_name):
