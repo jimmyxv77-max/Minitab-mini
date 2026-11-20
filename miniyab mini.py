@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import os
 import re
@@ -35,6 +36,9 @@ CHECK_ICON_SVG = (
     ' stroke-linecap="round" stroke-linejoin="round">'
     '<polyline points="20 6 9 17 4 12"></polyline></svg>'
 )
+
+BATCH_COLORS = ["#6495ED", "#E07A7A", "#34A853", "#9B6BDF", "#F29900"]
+BATCH_EDGE_COLORS = ["#3B5998", "#A8383B", "#1E7E34", "#5E35B1", "#B06000"]
 
 
 def render_copy_image_button(png_bytes, btn_key):
@@ -99,9 +103,8 @@ def render_copy_image_button(png_bytes, btn_key):
   components.html(html_code, height=40)
 
 
-def render_chart_action_bar(png_buf, file_name, key_prefix):
+def render_chart_action_bar(png_bytes, file_name, key_prefix):
   """紧凑并排展示「下载」按钮与「复制」图标按钮"""
-  png_bytes = png_buf.getvalue()
   a1, a2, _ = st.columns([0.85, 2.15, 7.0], gap="small")
   with a1:
     st.download_button(
@@ -210,7 +213,7 @@ def read_csv_compatible(file_bytes):
     raise last_err if last_err else ValueError("无法解析 CSV 文件")
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_workbook_sheets(file_bytes, filename):
   lower_name = filename.lower()
   if lower_name.endswith(".csv"):
@@ -325,6 +328,7 @@ def infer_parameter_groups(cols):
   return order, groups
 
 
+@st.cache_data(show_spinner=False)
 def parse_exclude_indices(range_text, max_row):
   excluded = set()
   if not range_text.strip():
@@ -369,43 +373,373 @@ def compute_within_std(mat, flat_vals):
   return m_mr / 1.12838 if m_mr > 0 else s_ov
 
 
+def _compute_spc_metrics_from_clean(
+    df_c,
+    df_r,
+    cell_cnt,
+    valid_cols,
+    p_lsl,
+    p_target,
+    p_usl,
+    apply_tuning,
+    center_align_pct,
+    tuning_mode,
+    manual_target_sigma,
+    target_cpk_goal,
+    extra_meta=None,
+):
+  s_mat_raw = df_c[valid_cols].to_numpy(dtype=float)
+  v_vals_raw = s_mat_raw[~np.isnan(s_mat_raw)]
+  if len(v_vals_raw) < 2:
+    return None
+
+  orig_m = float(np.mean(v_vals_raw))
+  orig_wi = compute_within_std(s_mat_raw, v_vals_raw)
+
+  if apply_tuning and orig_wi > 0:
+    adj_mean = orig_m + (p_target - orig_m) * (center_align_pct / 100.0)
+    if tuning_mode == "直接指定目标西格玛 (σ)" and manual_target_sigma is not None:
+      tgt_wi = float(manual_target_sigma)
+    else:
+      min_dist = min(p_usl - adj_mean, adj_mean - p_lsl)
+      tgt_wi = min_dist / (3.0 * target_cpk_goal) if min_dist > 0 else orig_wi
+    ratio = tgt_wi / orig_wi
+    for c_name in valid_cols:
+      df_c[c_name] = adj_mean + (df_c[c_name] - orig_m) * ratio
+    df_c["_Row_Mean_"] = df_c[valid_cols].mean(axis=1)
+
+  s_mat = df_c[valid_cols].to_numpy(dtype=float)
+  v_vals = s_mat[~np.isnan(s_mat)]
+  s_mean = float(np.mean(v_vals))
+  s_ov = float(np.std(v_vals, ddof=1))
+  s_wi = compute_within_std(s_mat, v_vals)
+  tot_n = len(v_vals)
+
+  cp_v = (p_usl - p_lsl) / (6.0 * s_wi) if s_wi > 0 else np.nan
+  cpl_v = (s_mean - p_lsl) / (3.0 * s_wi) if s_wi > 0 else np.nan
+  cpu_v = (p_usl - s_mean) / (3.0 * s_wi) if s_wi > 0 else np.nan
+  cpk_v = min(cpl_v, cpu_v)
+
+  pp_v = (p_usl - p_lsl) / (6.0 * s_ov) if s_ov > 0 else np.nan
+  ppl_v = (s_mean - p_lsl) / (3.0 * s_ov) if s_ov > 0 else np.nan
+  ppu_v = (p_usl - s_mean) / (3.0 * s_ov) if s_ov > 0 else np.nan
+  ppk_v = min(ppl_v, ppu_v)
+
+  obs_lt = float(np.sum(v_vals < p_lsl)) / tot_n * 1e6
+  obs_gt = float(np.sum(v_vals > p_usl)) / tot_n * 1e6
+  obs_tot = obs_lt + obs_gt
+
+  exp_ov_lt = (
+      stats.norm.cdf((p_lsl - s_mean) / s_ov) * 1e6 if s_ov > 0 else 0.0
+  )
+  exp_ov_gt = (
+      (1.0 - stats.norm.cdf((p_usl - s_mean) / s_ov)) * 1e6 if s_ov > 0 else 0.0
+  )
+  exp_ov_tot = exp_ov_lt + exp_ov_gt
+
+  exp_wi_lt = (
+      stats.norm.cdf((p_lsl - s_mean) / s_wi) * 1e6 if s_wi > 0 else 0.0
+  )
+  exp_wi_gt = (
+      (1.0 - stats.norm.cdf((p_usl - s_mean) / s_wi)) * 1e6 if s_wi > 0 else 0.0
+  )
+  exp_wi_tot = exp_wi_lt + exp_wi_gt
+
+  out = {
+      "cols": valid_cols,
+      "lsl": p_lsl,
+      "target": p_target,
+      "usl": p_usl,
+      "df_clean": df_c,
+      "df_removed": df_r,
+      "masked_cells": cell_cnt,
+      "all_valid_vals": v_vals,
+      "total_n": tot_n,
+      "sample_mean": s_mean,
+      "std_overall": s_ov,
+      "std_within": s_wi,
+      "cp": cp_v,
+      "cpl": cpl_v,
+      "cpu": cpu_v,
+      "cpk": cpk_v,
+      "pp": pp_v,
+      "ppl": ppl_v,
+      "ppu": ppu_v,
+      "ppk": ppk_v,
+      "obs_lt_lsl": obs_lt,
+      "obs_gt_usl": obs_gt,
+      "obs_total": obs_tot,
+      "exp_ov_lt_lsl": exp_ov_lt,
+      "exp_ov_gt_usl": exp_ov_gt,
+      "exp_ov_total": exp_ov_tot,
+      "exp_wi_lt_lsl": exp_wi_lt,
+      "exp_wi_gt_usl": exp_wi_gt,
+      "exp_wi_total": exp_wi_tot,
+  }
+  if extra_meta:
+    out.update(extra_meta)
+  return out
+
+
+@st.cache_data(show_spinner=False)
+def cached_build_v1_bundle(
+    df_raw,
+    proj_cols,
+    p_lsl,
+    p_target,
+    p_usl,
+    spike_mode,
+    spike_param_val,
+    spike_action,
+    pt_min_val,
+    pt_max_val,
+    exclude_ranges_str,
+    filter_mode,
+    custom_min,
+    custom_max,
+    apply_tuning,
+    center_align_pct,
+    tuning_mode,
+    manual_target_sigma,
+    target_cpk_goal,
+):
+  valid_cols = [c for c in proj_cols if c in df_raw.columns]
+  if not valid_cols:
+    return None
+
+  excl_set = parse_exclude_indices(exclude_ranges_str, len(df_raw))
+  df_w = df_raw.copy()
+  sub_raw = df_w[valid_cols].to_numpy(dtype=float)
+  sp_mask = np.zeros_like(sub_raw, dtype=bool)
+
+  if spike_mode != "不启用单点屏蔽":
+    if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
+      v_flat = sub_raw[~np.isnan(sub_raw)]
+      if len(v_flat) > 0:
+        med_v = float(np.median(v_flat))
+        mad_v = float(np.median(np.abs(v_flat - med_v)))
+        r_sig = mad_v * 1.4826
+        if r_sig <= 1e-12:
+          q75, q25 = np.percentile(v_flat, [75, 25])
+          r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
+        low_b = med_v - spike_param_val * r_sig
+        high_b = med_v + spike_param_val * r_sig
+        sp_mask = (~np.isnan(sub_raw)) & (
+            (sub_raw < low_b) | (sub_raw > high_b)
+        )
+    elif spike_mode == "按各项目 SPEC 公差倍数识别":
+      sp_span = p_usl - p_lsl
+      low_b = p_target - spike_param_val * sp_span
+      high_b = p_target + spike_param_val * sp_span
+      sp_mask = (~np.isnan(sub_raw)) & (
+          (sub_raw < low_b) | (sub_raw > high_b)
+      )
+    elif (
+        spike_mode == "自定义单点有效数值区间"
+        and pt_min_val is not None
+        and pt_max_val is not None
+    ):
+      sp_mask = (~np.isnan(sub_raw)) & (
+          (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
+      )
+
+  cell_cnt = int(np.sum(sp_mask))
+  row_has_sp = np.any(sp_mask, axis=1)
+
+  if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
+    cleaned = sub_raw.copy()
+    cleaned[sp_mask] = np.nan
+    for idx_c, c_name in enumerate(valid_cols):
+      df_w[c_name] = cleaned[:, idx_c]
+
+  df_w["_Row_Mean_"] = df_w[valid_cols].mean(axis=1)
+
+  m_not_nan = df_w["_Row_Mean_"].notna()
+  m_not_rng = ~df_w["Row_Index"].isin(excl_set)
+  m_no_sp_row = (
+      pd.Series(~row_has_sp, index=df_w.index)
+      if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
+      else pd.Series(True, index=df_w.index)
+  )
+  m_val_ok = pd.Series(True, index=df_w.index)
+
+  if filter_mode == "按各项目 SPEC 范围过滤":
+    m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
+  elif (
+      filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
+      and custom_min is not None
+      and custom_max is not None
+  ):
+    m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
+        df_w["_Row_Mean_"] <= custom_max
+    )
+
+  v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
+  df_c = df_w[v_mask].copy().reset_index(drop=True)
+  df_r = df_raw[~v_mask].copy().reset_index(drop=True)
+
+  return _compute_spc_metrics_from_clean(
+      df_c,
+      df_r,
+      cell_cnt,
+      valid_cols,
+      p_lsl,
+      p_target,
+      p_usl,
+      apply_tuning,
+      center_align_pct,
+      tuning_mode,
+      manual_target_sigma,
+      target_cpk_goal,
+  )
+
+
+@st.cache_data(show_spinner=False)
+def cached_prefilter_v2_batch(
+    df_src,
+    batch_label,
+    proj_cols,
+    p_lsl,
+    p_target,
+    p_usl,
+    spike_mode,
+    spike_param_val,
+    spike_action,
+    pt_min_val,
+    pt_max_val,
+    exclude_ranges_str,
+    filter_mode,
+    custom_min,
+    custom_max,
+):
+  valid_cols = [c for c in proj_cols if c in df_src.columns]
+  if not valid_cols:
+    return None
+
+  excl_set = parse_exclude_indices(exclude_ranges_str, len(df_src))
+  df_w = df_src.copy()
+  sub_raw = df_w[valid_cols].to_numpy(dtype=float)
+  sp_mask = np.zeros_like(sub_raw, dtype=bool)
+
+  if spike_mode != "不启用单点屏蔽":
+    if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
+      v_flat = sub_raw[~np.isnan(sub_raw)]
+      if len(v_flat) > 0:
+        med_v = float(np.median(v_flat))
+        mad_v = float(np.median(np.abs(v_flat - med_v)))
+        r_sig = mad_v * 1.4826
+        if r_sig <= 1e-12:
+          q75, q25 = np.percentile(v_flat, [75, 25])
+          r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
+        low_b = med_v - spike_param_val * r_sig
+        high_b = med_v + spike_param_val * r_sig
+        sp_mask = (~np.isnan(sub_raw)) & (
+            (sub_raw < low_b) | (sub_raw > high_b)
+        )
+    elif spike_mode == "按各项目 SPEC 公差倍数识别":
+      sp_span = p_usl - p_lsl
+      low_b = p_target - spike_param_val * sp_span
+      high_b = p_target + spike_param_val * sp_span
+      sp_mask = (~np.isnan(sub_raw)) & (
+          (sub_raw < low_b) | (sub_raw > high_b)
+      )
+    elif (
+        spike_mode == "自定义单点有效数值区间"
+        and pt_min_val is not None
+        and pt_max_val is not None
+    ):
+      sp_mask = (~np.isnan(sub_raw)) & (
+          (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
+      )
+
+  cell_cnt = int(np.sum(sp_mask))
+  row_has_sp = np.any(sp_mask, axis=1)
+
+  if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
+    cleaned = sub_raw.copy()
+    cleaned[sp_mask] = np.nan
+    for idx_c, c_name in enumerate(valid_cols):
+      df_w[c_name] = cleaned[:, idx_c]
+
+  df_w["_Row_Mean_"] = df_w[valid_cols].mean(axis=1)
+
+  m_not_nan = df_w["_Row_Mean_"].notna()
+  m_not_rng = ~df_w["Row_Index"].isin(excl_set)
+  m_no_sp_row = (
+      pd.Series(~row_has_sp, index=df_w.index)
+      if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
+      else pd.Series(True, index=df_w.index)
+  )
+  m_val_ok = pd.Series(True, index=df_w.index)
+
+  if filter_mode == "按各项目 SPEC 范围过滤":
+    m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
+  elif (
+      filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
+      and custom_min is not None
+      and custom_max is not None
+  ):
+    m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
+        df_w["_Row_Mean_"] <= custom_max
+    )
+
+  v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
+  df_c = df_w[v_mask].copy().reset_index(drop=True)
+  df_r = df_src[~v_mask].copy().reset_index(drop=True)
+  if len(df_c) < 2:
+    return None
+
+  return {
+      "batch_label": batch_label,
+      "valid_cols": valid_cols,
+      "df_clean": df_c,
+      "df_removed": df_r,
+      "masked_cells": cell_cnt,
+  }
+
+
 def save_fig_with_border(fig, show_outer_border=True, use_tight=False):
   fig.patch.set_facecolor("white")
   buf = io.BytesIO()
   try:
     if use_tight:
-      fig.canvas.draw()
-      renderer = getattr(fig.canvas, "get_renderer", lambda: None)()
-      fig_w_in, fig_h_in = fig.get_size_inches()
-      pad_in = 0.14
-      if show_outer_border and renderer is not None:
-        bbox_in = fig.get_tightbbox(renderer)
-        if (
-            bbox_in is not None
-            and bbox_in.width > 0
-            and bbox_in.height > 0
-            and fig_w_in > 0
-            and fig_h_in > 0
-        ):
-          x0 = (bbox_in.x0 - pad_in) / fig_w_in
-          y0 = (bbox_in.y0 - pad_in) / fig_h_in
-          w_norm = (bbox_in.width + 2 * pad_in) / fig_w_in
-          h_norm = (bbox_in.height + 2 * pad_in) / fig_h_in
-          border_rect = Rectangle(
-              (x0, y0),
-              w_norm,
-              h_norm,
-              transform=fig.transFigure,
-              fill=False,
-              edgecolor="#A6A6A6",
-              linewidth=1.2,
-              zorder=100,
-              clip_on=False,
-          )
-          fig.patches.append(border_rect)
-      fig.savefig(
-          buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in
-      )
+      if show_outer_border:
+        fig.canvas.draw()
+        renderer = getattr(fig.canvas, "get_renderer", lambda: None)()
+        fig_w_in, fig_h_in = fig.get_size_inches()
+        pad_in = 0.14
+        if renderer is not None:
+          bbox_in = fig.get_tightbbox(renderer)
+          if (
+              bbox_in is not None
+              and bbox_in.width > 0
+              and bbox_in.height > 0
+              and fig_w_in > 0
+              and fig_h_in > 0
+          ):
+            x0 = (bbox_in.x0 - pad_in) / fig_w_in
+            y0 = (bbox_in.y0 - pad_in) / fig_h_in
+            w_norm = (bbox_in.width + 2 * pad_in) / fig_w_in
+            h_norm = (bbox_in.height + 2 * pad_in) / fig_h_in
+            border_rect = Rectangle(
+                (x0, y0),
+                w_norm,
+                h_norm,
+                transform=fig.transFigure,
+                fill=False,
+                edgecolor="#A6A6A6",
+                linewidth=1.2,
+                zorder=100,
+                clip_on=False,
+            )
+            fig.patches.append(border_rect)
+        fig.savefig(
+            buf, format="png", dpi=170, bbox_inches="tight", pad_inches=pad_in
+        )
+      else:
+        fig.savefig(
+            buf, format="png", dpi=170, bbox_inches="tight", pad_inches=0.14
+        )
     else:
       if show_outer_border:
         fig.patch.set_edgecolor("#A6A6A6")
@@ -420,9 +754,27 @@ def save_fig_with_border(fig, show_outer_border=True, use_tight=False):
   except Exception:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150)
-  buf.seek(0)
   plt.close(fig)
-  return buf
+  return buf.getvalue()
+
+
+def _bundle_fingerprint(b):
+  """为已计算的 bundle 生成轻量指纹，作为图表缓存 key 的一部分"""
+  h = hashlib.md5()
+  h.update(
+      f"{b['total_n']}|{b['sample_mean']:.6f}|{b['std_overall']:.6f}|{b['std_within']:.6f}|"
+      f"{b['lsl']:.6f}|{b['target']:.6f}|{b['usl']:.6f}|{','.join(map(str, b['cols']))}".encode(
+          "utf-8"
+      )
+  )
+  if len(b["all_valid_vals"]) > 0:
+    arr = b["all_valid_vals"]
+    h.update(
+        f"{float(arr[0]):.6f}|{float(arr[-1]):.6f}|{float(np.sum(arr[: min(200, len(arr))])):.6f}".encode(
+            "utf-8"
+        )
+    )
+  return h.hexdigest()
 
 
 # ==================== 首页版本模式入口 ====================
@@ -532,6 +884,963 @@ def render_sidebar_mode_switcher(current_mode):
     st.markdown("---")
 
 
+# ==================== 缓存版绘图函数（v1.0 & v2.0 共用） ====================
+@st.cache_data(show_spinner=False)
+def cached_capability_png(
+    data_fp, b, title_str, w_in, h_in, show_outer_border
+):
+  fig = plt.figure(figsize=(w_in, h_in), dpi=170)
+  scale_f = min(w_in / 9.6, h_in / 7.2)
+  font_panel = max(7.2, 8.3 * scale_f)
+  font_title = max(11.5, 13.5 * scale_f)
+
+  gs = fig.add_gridspec(
+      2,
+      3,
+      width_ratios=[1.05, 2.35, 0.95],
+      height_ratios=[3.6, 1.15],
+      wspace=0.06,
+      hspace=0.22,
+  )
+  ax_left = fig.add_subplot(gs[0, 0])
+  ax_mid = fig.add_subplot(gs[0, 1])
+  ax_right = fig.add_subplot(gs[0, 2])
+  ax_bot_left = fig.add_subplot(gs[1, 0])
+  ax_bot_mid = fig.add_subplot(gs[1, 1])
+  ax_bot_right = fig.add_subplot(gs[1, 2])
+  for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
+    ax_tmp.axis("off")
+
+  all_v = b["all_valid_vals"]
+  tot_n = b["total_n"]
+  s_mean = b["sample_mean"]
+  s_ov = b["std_overall"]
+  s_wi = b["std_within"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+  bins_count = min(38, max(14, int(np.sqrt(tot_n) * 0.55)))
+  counts, _, _ = ax_mid.hist(
+      all_v,
+      bins=bins_count,
+      density=True,
+      color="#78A2CC",
+      edgecolor="#3A5F85",
+      linewidth=0.55,
+      alpha=0.92,
+  )
+
+  span = max(p_usl - p_lsl, 1e-6)
+  x_min_c = min(p_lsl - 0.18 * span, float(np.min(all_v)) - 0.08 * span)
+  x_max_c = max(p_usl + 0.18 * span, float(np.max(all_v)) + 0.08 * span)
+  x_grid = np.linspace(x_min_c, x_max_c, 500)
+
+  line_ov, line_wi = None, None
+  if s_ov > 1e-12:
+    (line_ov,) = ax_mid.plot(
+        x_grid,
+        stats.norm.pdf(x_grid, s_mean, s_ov),
+        color="#B91C1C",
+        lw=1.8,
+        label="Overall",
+    )
+  if s_wi > 1e-12:
+    (line_wi,) = ax_mid.plot(
+        x_grid,
+        stats.norm.pdf(x_grid, s_mean, s_wi),
+        color="#374151",
+        lw=1.6,
+        ls="--",
+        label="Within",
+    )
+
+  ax_mid.axvline(p_lsl, color="#DC2626", ls="--", lw=1.15)
+  ax_mid.axvline(p_usl, color="#DC2626", ls="--", lw=1.15)
+  ax_mid.axvline(p_target, color="#16A34A", ls=":", lw=1.1)
+
+  y_peak = max(
+      float(np.max(counts)) if len(counts) else 1.0,
+      float(np.max(stats.norm.pdf(x_grid, s_mean, s_wi)))
+      if s_wi > 1e-12
+      else 1.0,
+      1e-6,
+  )
+  ax_mid.set_ylim(0, y_peak * 1.14)
+  ax_mid.set_yticks([])
+  ax_mid.tick_params(axis="x", labelsize=max(7.5, 8.8 * scale_f))
+  ax_mid.grid(True, axis="x", ls=":", alpha=0.45)
+
+  lbl_sz = max(7.5, 8.5 * scale_f)
+  ax_mid.text(
+      p_lsl,
+      y_peak * 1.16,
+      f"LSL\n{p_lsl:.2f}",
+      color="#B91C1C",
+      ha="center",
+      va="bottom",
+      fontsize=lbl_sz,
+      fontweight="bold",
+  )
+  ax_mid.text(
+      p_usl,
+      y_peak * 1.16,
+      f"USL\n{p_usl:.2f}",
+      color="#B91C1C",
+      ha="center",
+      va="bottom",
+      fontsize=lbl_sz,
+      fontweight="bold",
+  )
+  ax_mid.text(
+      p_target,
+      y_peak * 1.16,
+      f"Target\n{p_target:.2f}",
+      color="#15803D",
+      ha="center",
+      va="bottom",
+      fontsize=lbl_sz,
+  )
+
+  left_text = (
+      f"Process Data\n----------------------\n"
+      f"LSL          {p_lsl:.4f}\nTarget       {p_target:.4f}\nUSL          {p_usl:.4f}\n"
+      f"Mean         {s_mean:.4f}\nSample N     {tot_n}\nValid Rows   {len(b['df_clean'])}\n"
+      f"Subgroup     {len(b['cols'])}\nStDev(Ov)    {s_ov:.5f}\nStDev(Wi)    {s_wi:.5f}"
+  )
+  ax_left.text(
+      0.95,
+      0.96,
+      left_text,
+      transform=ax_left.transAxes,
+      va="top",
+      ha="right",
+      fontsize=font_panel,
+      fontfamily="monospace",
+      color="#1E293B",
+  )
+
+  right_text = (
+      f"Overall Capability\n------------------\n"
+      f"Pp        {b['pp']:.2f}\nPPL       {b['ppl']:.2f}\nPPU       {b['ppu']:.2f}\nPpk       {b['ppk']:.2f}\n\n"
+      f"Potential (Within)\n------------------\n"
+      f"Cp        {b['cp']:.2f}\nCPL       {b['cpl']:.2f}\nCPU       {b['cpu']:.2f}\nCpk       {b['cpk']:.2f}"
+  )
+  ax_right.text(
+      0.06,
+      0.96,
+      right_text,
+      transform=ax_right.transAxes,
+      va="top",
+      ha="left",
+      fontsize=font_panel,
+      fontfamily="monospace",
+      color="#1E293B",
+  )
+
+  handles_leg = [h for h in (line_ov, line_wi) if h is not None]
+  if handles_leg:
+    ax_bot_right.legend(
+        handles=handles_leg,
+        loc="upper left",
+        bbox_to_anchor=(0.04, 0.98),
+        fontsize=font_panel,
+    )
+
+  ppm_text = (
+      f"Performance (PPM)        Observed    Exp. Overall    Exp. Within\n"
+      f"----------------------------------------------------------------\n"
+      f"PPM < LSL               {b['obs_lt_lsl']:9.2f}       {b['exp_ov_lt_lsl']:9.2f}      {b['exp_wi_lt_lsl']:9.2f}\n"
+      f"PPM > USL               {b['obs_gt_usl']:9.2f}       {b['exp_ov_gt_usl']:9.2f}      {b['exp_wi_gt_usl']:9.2f}\n"
+      f"Total PPM               {b['obs_total']:9.2f}       {b['exp_ov_total']:9.2f}      {b['exp_wi_total']:9.2f}"
+  )
+  ax_bot_mid.text(
+      0.5,
+      0.92,
+      ppm_text,
+      transform=ax_bot_mid.transAxes,
+      va="top",
+      ha="center",
+      fontsize=max(7.0, font_panel * 0.96),
+      fontfamily="monospace",
+      color="#1E293B",
+      bbox=dict(
+          boxstyle="round,pad=0.4", facecolor="#F8FAFC", edgecolor="#E2E8F0"
+      ),
+  )
+
+  fig.suptitle(
+      title_str,
+      fontsize=font_title,
+      fontweight="bold",
+      y=0.96,
+      fontproperties=FONT_PROP,
+  )
+  plt.subplots_adjust(left=0.025, right=0.975, top=0.835, bottom=0.045)
+  return save_fig_with_border(fig, show_outer_border, use_tight=False)
+
+
+@st.cache_data(show_spinner=False)
+def cached_box_png(
+    data_fp,
+    b,
+    title_str,
+    w_in,
+    h_in,
+    show_outliers,
+    show_median_val,
+    show_mean_val,
+    decimals,
+    show_outer_border,
+):
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+  df_c = b["df_clean"]
+  p_cols = b["cols"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+  box_data = [
+      arr if len(arr) > 0 else np.array([p_target], dtype=float)
+      for arr in (df_c[c].dropna().to_numpy(dtype=float) for c in p_cols)
+  ]
+  box_labels = [str(c) for c in p_cols]
+  n_boxes = len(box_data)
+  box_width = 0.42 if n_boxes <= 15 else 0.36
+
+  ax.boxplot(
+      box_data,
+      tick_labels=box_labels,
+      patch_artist=True,
+      showfliers=show_outliers,
+      widths=box_width,
+      boxprops=dict(facecolor="#78A2CC", edgecolor="#2B4C7E", linewidth=1.0),
+      medianprops=dict(color="#111827", linewidth=1.3),
+      whiskerprops=dict(color="#2B4C7E", linewidth=1.0),
+      capprops=dict(color="#2B4C7E", linewidth=1.0),
+  )
+
+  ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+  ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
+
+  width_scale = min(w_in / 11.0, 1.15)
+  if show_median_val or show_mean_val:
+    label_font_size = (
+        (8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0))
+        * width_scale
+    )
+    x_offset = box_width * 0.54
+    fmt_str = f"{{:.{decimals}f}}"
+
+    y_min_cur, y_max_cur = ax.get_ylim()
+    y_span_cur = max(y_max_cur - y_min_cur, 1e-6)
+
+    for idx, arr in enumerate(box_data):
+      x_pos = (idx + 1) + x_offset
+      med_v = float(np.median(arr)) if show_median_val else None
+      mean_v = float(np.mean(arr)) if show_mean_val else None
+
+      if show_median_val and show_mean_val:
+        min_gap = y_span_cur * 0.032
+        y_med_txt, y_mean_txt = med_v, mean_v
+        if abs(y_mean_txt - y_med_txt) < min_gap:
+          if y_mean_txt >= y_med_txt:
+            y_mean_txt = med_v + min_gap * 0.6
+            y_med_txt = med_v - min_gap * 0.6
+          else:
+            y_mean_txt = med_v - min_gap * 0.6
+            y_med_txt = med_v + min_gap * 0.6
+        ax.text(
+            x_pos,
+            y_med_txt,
+            f"Med:{fmt_str.format(med_v)}",
+            va="center",
+            ha="left",
+            fontsize=label_font_size,
+            color="#1F2937",
+        )
+        ax.text(
+            x_pos,
+            y_mean_txt,
+            f"Avg:{fmt_str.format(mean_v)}",
+            va="center",
+            ha="left",
+            fontsize=label_font_size,
+            color="#1D4ED8",
+        )
+      elif show_median_val:
+        ax.text(
+            x_pos,
+            med_v,
+            fmt_str.format(med_v),
+            va="center",
+            ha="left",
+            fontsize=label_font_size,
+            color="#1F2937",
+        )
+      elif show_mean_val:
+        ax.text(
+            x_pos,
+            mean_v,
+            fmt_str.format(mean_v),
+            va="center",
+            ha="left",
+            fontsize=label_font_size,
+            color="#1D4ED8",
+        )
+
+    ax.set_xlim(0.4, n_boxes + 1.05)
+
+  ax_r = ax.twinx()
+  ax_r.set_ylim(ax.get_ylim())
+  ax_r.set_yticks([p_lsl, p_target, p_usl])
+  ax_r.set_yticklabels(
+      [f"{p_lsl}", f"{p_target}", f"{p_usl}"],
+      color="#B91C1C",
+      fontsize=8.8,
+      fontweight="bold",
+  )
+
+  ax.set_title(
+      title_str,
+      fontsize=max(11.5, 13.5 * width_scale),
+      fontweight="bold",
+      pad=12,
+      fontproperties=FONT_PROP,
+  )
+  ax.set_ylabel("Value", fontsize=10)
+  ax.tick_params(
+      axis="x", rotation=45 if len(box_labels) > 5 else 0, labelsize=8.8
+  )
+  for lbl in ax.get_xticklabels():
+    lbl.set_fontproperties(FONT_PROP)
+  ax.grid(True, ls=":", alpha=0.45)
+  plt.tight_layout(pad=1.2)
+  return save_fig_with_border(fig, show_outer_border, use_tight=False)
+
+
+@st.cache_data(show_spinner=False)
+def cached_time_series_png(
+    data_fp,
+    b,
+    title_str,
+    w_in,
+    h_in,
+    x_mode_opt,
+    y_mode_opt,
+    ymin_val,
+    ymax_val,
+    show_outer_border,
+):
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+  df_c = b["df_clean"]
+  p_cols = b["cols"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+  if x_mode_opt == "保留原始表格行号 (Row Index)":
+    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
+    x_label_text = "Original Row Index"
+  else:
+    x_seq = np.arange(1, len(df_c) + 1)
+    x_label_text = "Filtered Sequence Index (1..N)"
+
+  markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
+  cmap = plt.get_cmap("tab20")
+  step_mark = max(1, len(x_seq) // 250)
+
+  for idx, col_name in enumerate(p_cols):
+    y_col = df_c[col_name].to_numpy(dtype=float)
+    ax.plot(
+        x_seq,
+        y_col,
+        color=cmap(idx % 20),
+        lw=1.1,
+        marker=markers[idx % len(markers)],
+        markersize=3.2,
+        markevery=step_mark,
+        alpha=0.85,
+        label=str(col_name),
+    )
+
+  ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+  ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
+
+  if (
+      y_mode_opt == "自定义范围 (Manual)"
+      and ymin_val is not None
+      and ymax_val is not None
+      and ymin_val < ymax_val
+  ):
+    ax.set_ylim(ymin_val, ymax_val)
+
+  width_scale = min(w_in / 11.0, 1.15)
+  ax.set_title(
+      title_str,
+      fontsize=max(11.5, 13.5 * width_scale),
+      fontweight="bold",
+      pad=12,
+      fontproperties=FONT_PROP,
+  )
+  ax.set_xlabel(x_label_text, fontsize=10)
+  ax.set_ylabel("Value", fontsize=10)
+  ax.grid(True, ls=":", alpha=0.45)
+
+  handles, labels_ts = ax.get_legend_handles_labels()
+  if w_in / h_in < 1.55:
+    n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
+    ax.legend(
+        handles[:20],
+        labels_ts[:20],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.15),
+        ncol=n_cols_leg,
+        prop=FONT_PROP,
+        fontsize=7.6,
+        frameon=True,
+    )
+  else:
+    leg = ax.legend(
+        handles[:20],
+        labels_ts[:20],
+        title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        prop=FONT_PROP,
+        fontsize=8.0,
+    )
+    leg.get_title().set_fontsize(8.8)
+
+  plt.tight_layout(pad=1.0)
+  return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
+
+@st.cache_data(show_spinner=False)
+def cached_scatter_series_png(
+    data_fp,
+    b,
+    title_str,
+    w_in,
+    h_in,
+    x_mode_opt,
+    y_mode_opt,
+    ymin_val,
+    ymax_val,
+    point_size,
+    show_outer_border,
+):
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+  df_c = b["df_clean"]
+  p_cols = b["cols"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+  if x_mode_opt == "保留原始表格行号 (Row Index)":
+    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
+    x_label_text = "Original Row Index"
+  else:
+    x_seq = np.arange(1, len(df_c) + 1)
+    x_label_text = "Filtered Sequence Index (1..N)"
+
+  n_pts = len(x_seq)
+  if point_size is None:
+    if n_pts > 5000:
+      pt_s = 4.5
+    elif n_pts > 1500:
+      pt_s = 7.0
+    else:
+      pt_s = 11.0
+  else:
+    pt_s = float(point_size)
+
+  markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
+  cmap = plt.get_cmap("tab20")
+
+  for idx, col_name in enumerate(p_cols):
+    y_col = df_c[col_name].to_numpy(dtype=float)
+    ax.scatter(
+        x_seq,
+        y_col,
+        color=cmap(idx % 20),
+        marker=markers[idx % len(markers)],
+        s=pt_s,
+        alpha=0.72,
+        edgecolors="none",
+        label=str(col_name),
+    )
+
+  ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
+  ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
+  ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
+
+  if (
+      y_mode_opt == "自定义范围 (Manual)"
+      and ymin_val is not None
+      and ymax_val is not None
+      and ymin_val < ymax_val
+  ):
+    ax.set_ylim(ymin_val, ymax_val)
+
+  width_scale = min(w_in / 11.0, 1.15)
+  ax.set_title(
+      title_str,
+      fontsize=max(11.5, 13.5 * width_scale),
+      fontweight="bold",
+      pad=12,
+      fontproperties=FONT_PROP,
+  )
+  ax.set_xlabel(x_label_text, fontsize=10)
+  ax.set_ylabel("Value", fontsize=10)
+  ax.grid(True, ls=":", alpha=0.45)
+
+  handles, labels_sc = ax.get_legend_handles_labels()
+  if w_in / h_in < 1.55:
+    n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
+    ax.legend(
+        handles[:20],
+        labels_sc[:20],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.15),
+        ncol=n_cols_leg,
+        prop=FONT_PROP,
+        fontsize=7.6,
+        frameon=True,
+    )
+  else:
+    leg = ax.legend(
+        handles[:20],
+        labels_sc[:20],
+        title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        prop=FONT_PROP,
+        fontsize=8.0,
+    )
+    leg.get_title().set_fontsize(8.8)
+
+  plt.tight_layout(pad=1.0)
+  return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
+
+@st.cache_data(show_spinner=False)
+def cached_row_mean_png(
+    data_fp,
+    b,
+    title_str,
+    w_in,
+    h_in,
+    x_mode_opt,
+    y_mode_opt,
+    ymin_val,
+    ymax_val,
+    show_outer_border,
+):
+  fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
+  ax.set_facecolor("white")
+  df_c = b["df_clean"]
+  p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
+
+  if x_mode_opt == "保留原始表格行号 (Row Index)":
+    x_seq = df_c["Row_Index"].to_numpy(dtype=int)
+  else:
+    x_seq = np.arange(1, len(df_c) + 1)
+
+  y_mean_series = df_c["_Row_Mean_"].to_numpy(dtype=float)
+
+  ax.plot(
+      x_seq,
+      np.full_like(x_seq, p_target, dtype=float),
+      color="#4472C4",
+      lw=2.5,
+      label="目标值",
+  )
+  ax.plot(
+      x_seq,
+      np.full_like(x_seq, p_usl, dtype=float),
+      color="#ED7D31",
+      lw=2.5,
+      label="规格上限",
+  )
+  ax.plot(
+      x_seq,
+      np.full_like(x_seq, p_lsl, dtype=float),
+      color="#A5A5A5",
+      lw=2.5,
+      label="规格下限",
+  )
+  ax.plot(
+      x_seq,
+      y_mean_series,
+      color="#FFC000",
+      lw=2.2,
+      label="平均值",
+  )
+
+  if (
+      y_mode_opt == "自定义范围 (Manual)"
+      and ymin_val is not None
+      and ymax_val is not None
+      and ymin_val < ymax_val
+  ):
+    ax.set_ylim(ymin_val, ymax_val)
+  else:
+    spec_span = max(p_usl - p_lsl, 1e-6)
+    y_low = min(
+        p_lsl - 0.5 * spec_span,
+        float(np.min(y_mean_series)) - 0.15 * spec_span,
+    )
+    y_high = max(
+        p_usl + 0.25 * spec_span,
+        float(np.max(y_mean_series)) + 0.15 * spec_span,
+    )
+    ax.set_ylim(y_low, y_high)
+
+  if len(x_seq) >= 2 and x_seq[-1] > x_seq[0]:
+    ax.set_xlim(x_seq[0], x_seq[-1])
+
+  if len(x_seq) > 1:
+    n_ticks = max(12, int(w_in * 2.1))
+    tick_step = max(1, len(x_seq) // n_ticks)
+    tick_positions = x_seq[::tick_step]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(
+        [str(v) for v in tick_positions],
+        rotation=90,
+        fontsize=9.0,
+        color="#595959",
+    )
+
+  ax.tick_params(axis="y", labelsize=9.5, colors="#595959", length=0)
+  ax.tick_params(axis="x", length=0, pad=5)
+  ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color="#D9D9D9")
+  ax.spines["top"].set_visible(False)
+  ax.spines["right"].set_visible(False)
+  ax.spines["left"].set_visible(False)
+
+  width_scale = min(w_in / 10.5, 1.15)
+  ax.set_title(
+      title_str,
+      fontsize=max(13.5, 16.5 * width_scale),
+      fontweight="normal",
+      color="#595959",
+      pad=16,
+      fontproperties=FONT_PROP,
+  )
+
+  leg = ax.legend(
+      loc="upper center",
+      bbox_to_anchor=(0.5, -0.14),
+      ncol=4,
+      frameon=False,
+      prop=FONT_PROP,
+      fontsize=10.5,
+      handlelength=2.2,
+      columnspacing=1.8,
+  )
+  for text in leg.get_texts():
+    text.set_color("#595959")
+
+  plt.tight_layout(pad=1.0)
+  return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
+
+@st.cache_data(show_spinner=False)
+def cached_grouped_histogram_png(
+    batch_labels_all,
+    p_batch_dict,
+    title_str,
+    bins_num,
+    y_metric,
+    show_normal_fit,
+    show_spec_lines,
+    show_outer_border,
+):
+  active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
+  first_b = p_batch_dict[active_labels[0]]
+  p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
+
+  fig, ax = plt.subplots(figsize=(11.5, 5.8), dpi=170)
+  ax.set_facecolor("white")
+
+  all_concat = np.concatenate(
+      [p_batch_dict[lbl]["all_valid_vals"] for lbl in active_labels]
+  )
+  x_min_d, x_max_d = float(np.min(all_concat)), float(np.max(all_concat))
+  if x_max_d <= x_min_d:
+    x_max_d = x_min_d + 1.0
+  bin_edges = np.linspace(x_min_d, x_max_d, int(bins_num) + 1)
+  bin_width = bin_edges[1] - bin_edges[0]
+  is_density = "密度" in y_metric
+
+  max_y_val = 1.0
+  x_curve = np.linspace(
+      min(x_min_d, p_lsl if show_spec_lines else x_min_d) - 0.5 * bin_width,
+      max(x_max_d, p_usl if show_spec_lines else x_max_d) + 0.5 * bin_width,
+      400,
+  )
+
+  for idx, lbl in enumerate(active_labels):
+    b = p_batch_dict[lbl]
+    vals = b["all_valid_vals"]
+    col_fill = BATCH_COLORS[idx % len(BATCH_COLORS)]
+    col_edge = BATCH_EDGE_COLORS[idx % len(BATCH_EDGE_COLORS)]
+
+    counts_arr, _, _ = ax.hist(
+        vals,
+        bins=bin_edges,
+        density=is_density,
+        color=col_fill,
+        edgecolor=col_edge,
+        linewidth=0.75,
+        alpha=0.46,
+        label=f"{lbl} (N={len(vals)}, μ={b['sample_mean']:.3f})",
+    )
+    if len(counts_arr) > 0:
+      max_y_val = max(max_y_val, float(np.max(counts_arr)))
+
+    if show_normal_fit and len(vals) >= 2:
+      mu_v = float(np.mean(vals))
+      sd_v = float(np.std(vals, ddof=1))
+      if sd_v > 1e-12:
+        pdf_y = stats.norm.pdf(x_curve, mu_v, sd_v)
+        curve_y = pdf_y if is_density else pdf_y * len(vals) * bin_width
+        max_y_val = max(max_y_val, float(np.max(curve_y)))
+        ax.plot(
+            x_curve,
+            curve_y,
+            color=col_edge,
+            lw=1.8,
+            ls="-",
+            alpha=0.92,
+            label=f"{lbl} 正态拟合 (σ={sd_v:.4f})",
+        )
+
+  if show_spec_lines:
+    ax.axvline(
+        p_lsl, color="#DC2626", ls="--", lw=1.25, label=f"LSL ({p_lsl})"
+    )
+    ax.axvline(
+        p_target,
+        color="#16A34A",
+        ls="-.",
+        lw=1.1,
+        label=f"Target ({p_target})",
+    )
+    ax.axvline(
+        p_usl, color="#DC2626", ls="--", lw=1.25, label=f"USL ({p_usl})"
+    )
+
+  ax.set_ylim(0, max_y_val * 1.12)
+  ax.set_title(
+      title_str,
+      fontsize=13,
+      fontweight="bold",
+      pad=12,
+      fontproperties=FONT_PROP,
+  )
+  ax.set_xlabel("数据", fontsize=10, fontproperties=FONT_PROP)
+  ax.set_ylabel(
+      "概率密度" if is_density else "频数",
+      fontsize=10,
+      fontproperties=FONT_PROP,
+  )
+  ax.tick_params(axis="both", labelsize=9, colors="#475569")
+  ax.grid(True, ls=":", alpha=0.45, color="#CBD5E1")
+  ax.spines["top"].set_visible(False)
+  ax.spines["right"].set_visible(False)
+
+  ax.legend(
+      prop=FONT_PROP,
+      fontsize=8.2,
+      loc="upper right",
+      frameon=True,
+      facecolor="white",
+      edgecolor="#E2E8F0",
+  )
+  plt.tight_layout()
+  return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
+
+@st.cache_data(show_spinner=False)
+def cached_multi_batch_comparison_png(
+    batch_labels_all, p_batch_dict, title_str, show_outer_border
+):
+  active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
+  first_b = p_batch_dict[active_labels[0]]
+  p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
+
+  fig = plt.figure(figsize=(12.2, 6.2), dpi=170)
+  gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1.25], wspace=0.25)
+  ax_dist = fig.add_subplot(gs[0, 0])
+  ax_kpi = fig.add_subplot(gs[0, 1])
+
+  span = max(p_usl - p_lsl, 1e-6)
+  all_concat = np.concatenate(
+      [p_batch_dict[lbl]["all_valid_vals"] for lbl in active_labels]
+  )
+  x_min = min(p_lsl - 0.15 * span, float(np.min(all_concat)) - 0.05 * span)
+  x_max = max(p_usl + 0.15 * span, float(np.max(all_concat)) + 0.05 * span)
+  x_grid = np.linspace(x_min, x_max, 400)
+
+  for idx, lbl in enumerate(active_labels):
+    b = p_batch_dict[lbl]
+    col = BATCH_COLORS[idx % len(BATCH_COLORS)]
+    s_ov = b["std_overall"]
+    if s_ov > 1e-12:
+      ax_dist.plot(
+          x_grid,
+          stats.norm.pdf(x_grid, b["sample_mean"], s_ov),
+          color=col,
+          lw=2.0,
+          label=f"{lbl} (CPK={b['cpk']:.2f}, μ={b['sample_mean']:.3f})",
+      )
+    ax_dist.axvline(b["sample_mean"], color=col, ls=":", lw=1.1, alpha=0.8)
+
+  ax_dist.axvline(p_lsl, color="#DC2626", ls="--", lw=1.3)
+  ax_dist.axvline(p_usl, color="#DC2626", ls="--", lw=1.3)
+  ax_dist.axvline(p_target, color="#16A34A", ls="-.", lw=1.1)
+
+  y_top = ax_dist.get_ylim()[1]
+  ax_dist.text(
+      p_lsl,
+      y_top * 0.98,
+      f"LSL {p_lsl}",
+      color="#B91C1C",
+      ha="center",
+      va="top",
+      fontsize=8.2,
+      fontweight="bold",
+  )
+  ax_dist.text(
+      p_usl,
+      y_top * 0.98,
+      f"USL {p_usl}",
+      color="#B91C1C",
+      ha="center",
+      va="top",
+      fontsize=8.2,
+      fontweight="bold",
+  )
+  ax_dist.text(
+      p_target,
+      y_top * 0.98,
+      f"Tgt {p_target}",
+      color="#15803D",
+      ha="center",
+      va="top",
+      fontsize=8.2,
+  )
+
+  ax_dist.set_title(
+      "各批次正态分布与中心偏移对比",
+      fontsize=10.5,
+      fontproperties=FONT_PROP,
+  )
+  ax_dist.set_xlabel("测量值", fontsize=9.5, fontproperties=FONT_PROP)
+  ax_dist.set_ylabel("概率密度", fontsize=9.5, fontproperties=FONT_PROP)
+  ax_dist.legend(prop=FONT_PROP, fontsize=8.0, loc="upper left")
+  ax_dist.grid(True, ls=":", alpha=0.45)
+
+  x_pos = np.arange(len(active_labels))
+  bar_w = 0.34
+  cpk_vals = [p_batch_dict[lbl]["cpk"] for lbl in active_labels]
+  ppk_vals = [p_batch_dict[lbl]["ppk"] for lbl in active_labels]
+
+  bars1 = ax_kpi.bar(
+      x_pos - bar_w / 2,
+      cpk_vals,
+      width=bar_w,
+      color="#2563EB",
+      label="CPK (组内)",
+  )
+  bars2 = ax_kpi.bar(
+      x_pos + bar_w / 2,
+      ppk_vals,
+      width=bar_w,
+      color="#93C5FD",
+      edgecolor="#1D4ED8",
+      label="PPK (整体)",
+  )
+  ax_kpi.axhline(1.33, color="#16A34A", ls="--", lw=1.1, label="基准 1.33")
+  ax_kpi.axhline(1.00, color="#DC2626", ls=":", lw=1.0, label="警戒 1.00")
+
+  for br in list(bars1) + list(bars2):
+    h_val = br.get_height()
+    if np.isfinite(h_val):
+      ax_kpi.text(
+          br.get_x() + br.get_width() / 2,
+          h_val + 0.03,
+          f"{h_val:.2f}",
+          ha="center",
+          va="bottom",
+          fontsize=7.8,
+      )
+
+  ax_kpi.set_xticks(x_pos)
+  ax_kpi.set_xticklabels(
+      [lbl.split(":")[0] for lbl in active_labels],
+      fontsize=8.8,
+      fontproperties=FONT_PROP,
+  )
+  ax_kpi.set_ylim(0, max(1.8, float(np.nanmax(cpk_vals + ppk_vals)) * 1.22))
+  ax_kpi.set_title("各批次过程能力指数对比", fontsize=10.5, fontproperties=FONT_PROP)
+  ax_kpi.legend(prop=FONT_PROP, fontsize=7.6, loc="upper right")
+  ax_kpi.grid(True, axis="y", ls=":", alpha=0.45)
+
+  fig.suptitle(
+      title_str,
+      fontsize=13,
+      fontweight="bold",
+      y=0.98,
+      fontproperties=FONT_PROP,
+  )
+  plt.tight_layout(rect=[0, 0, 1, 0.93])
+  return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
+
+@st.cache_data(show_spinner=False)
+def cached_multi_batch_mean_trend_png(
+    batch_labels_all, p_batch_dict, title_str, show_outer_border
+):
+  active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
+  first_b = p_batch_dict[active_labels[0]]
+  p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
+
+  fig, ax = plt.subplots(figsize=(12.8, 5.4), dpi=170)
+  max_len = 1
+  for idx, lbl in enumerate(active_labels):
+    y_m = p_batch_dict[lbl]["df_clean"]["_Row_Mean_"].to_numpy(dtype=float)
+    x_s = np.arange(1, len(y_m) + 1)
+    max_len = max(max_len, len(y_m))
+    ax.plot(
+        x_s,
+        y_m,
+        color=BATCH_COLORS[idx % len(BATCH_COLORS)],
+        lw=1.8,
+        alpha=0.88,
+        label=lbl,
+    )
+
+  ax.axhline(
+      p_usl, color="#DC2626", ls="--", lw=1.2, label=f"USL ({p_usl})"
+  )
+  ax.axhline(
+      p_target, color="#16A34A", ls="-.", lw=1.1, label=f"Target ({p_target})"
+  )
+  ax.axhline(
+      p_lsl, color="#DC2626", ls="--", lw=1.2, label=f"LSL ({p_lsl})"
+  )
+
+  ax.set_xlim(1, max(2, max_len))
+  ax.set_title(
+      title_str, fontsize=12.5, fontweight="bold", fontproperties=FONT_PROP
+  )
+  ax.set_xlabel(
+      "区间内样本序号 (1..N)", fontsize=9.5, fontproperties=FONT_PROP
+  )
+  ax.set_ylabel("行均值", fontsize=9.5, fontproperties=FONT_PROP)
+  ax.grid(True, ls=":", alpha=0.45)
+  ax.legend(prop=FONT_PROP, fontsize=8.2, ncol=min(5, len(active_labels) + 3))
+  plt.tight_layout()
+  return save_fig_with_border(fig, show_outer_border, use_tight=True)
+
+
 # ==============================================================================
 #                   版本 1.0：单批 / 多同表头批次纵向堆叠分析
 # ==============================================================================
@@ -582,7 +1891,6 @@ def run_v1_app():
         "sheets": s_dict,
     })
 
-  # 优先取所有上传文件的公共工作表；若不完全一致，取第一个文件的 Sheet 列表作为下拉选项
   common_sheet_names = [
       sh
       for sh in file_sheets_list[0]["sheets"].keys()
@@ -627,7 +1935,6 @@ def run_v1_app():
     st.error("所选工作表无有效数据，请检查表格内容。")
     st.stop()
 
-  # 多文件按顺序往下堆叠（保留所有列，同表头自动纵向对齐）
   df_raw = pd.concat(stacked_parts, ignore_index=True)
   df_raw = df_raw.dropna(how="all").reset_index(drop=True)
 
@@ -670,7 +1977,9 @@ def run_v1_app():
       g for g in group_order if not is_likely_non_measurement(g)
   ]
 
-  files_sig = "||".join(f"{it['name']}:{len(it['sheets'])}" for it in file_sheets_list)
+  files_sig = "||".join(
+      f"{it['name']}:{len(it['sheets'])}" for it in file_sheets_list
+  )
   dataset_key = f"{files_sig}::{selected_sheet}::{len(df_raw)}"
 
   if st.session_state.get("v1_active_dataset_key") != dataset_key:
@@ -1046,7 +2355,6 @@ def run_v1_app():
       placeholder="例如: 1-250, 600-630",
       key=f"v1_excl_rows_{dataset_key}",
   )
-  excluded_rows_set = parse_exclude_indices(exclude_ranges_str, len(df_raw))
 
   filter_mode = st.sidebar.selectbox(
       "行均值数值筛选规则",
@@ -1123,183 +2431,39 @@ def run_v1_app():
           key=f"v1_tgt_cpk_{dataset_key}",
       )
 
-  def build_project_dataset(p_name, proj_cols, p_lsl, p_target, p_usl):
-    df_w = df_raw.copy()
-    sub_raw = df_w[proj_cols].to_numpy(dtype=float)
-    sp_mask = np.zeros_like(sub_raw, dtype=bool)
-
-    if spike_mode != "不启用单点屏蔽":
-      if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
-        v_flat = sub_raw[~np.isnan(sub_raw)]
-        if len(v_flat) > 0:
-          med_v = float(np.median(v_flat))
-          mad_v = float(np.median(np.abs(v_flat - med_v)))
-          r_sig = mad_v * 1.4826
-          if r_sig <= 1e-12:
-            q75, q25 = np.percentile(v_flat, [75, 25])
-            r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
-          low_b = med_v - spike_param_val * r_sig
-          high_b = med_v + spike_param_val * r_sig
-          sp_mask = (~np.isnan(sub_raw)) & (
-              (sub_raw < low_b) | (sub_raw > high_b)
-          )
-      elif spike_mode == "按各项目 SPEC 公差倍数识别":
-        sp_span = p_usl - p_lsl
-        low_b = p_target - spike_param_val * sp_span
-        high_b = p_target + spike_param_val * sp_span
-        sp_mask = (~np.isnan(sub_raw)) & (
-            (sub_raw < low_b) | (sub_raw > high_b)
-        )
-      elif (
-          spike_mode == "自定义单点有效数值区间"
-          and pt_min_val is not None
-          and pt_max_val is not None
-      ):
-        sp_mask = (~np.isnan(sub_raw)) & (
-            (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
-        )
-
-    cell_cnt = int(np.sum(sp_mask))
-    row_has_sp = np.any(sp_mask, axis=1)
-
-    if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
-      cleaned = sub_raw.copy()
-      cleaned[sp_mask] = np.nan
-      for idx_c, c_name in enumerate(proj_cols):
-        df_w[c_name] = cleaned[:, idx_c]
-
-    df_w["_Row_Mean_"] = df_w[proj_cols].mean(axis=1)
-
-    m_not_nan = df_w["_Row_Mean_"].notna()
-    m_not_rng = ~df_w["Row_Index"].isin(excluded_rows_set)
-    m_no_sp_row = (
-        pd.Series(~row_has_sp, index=df_w.index)
-        if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
-        else pd.Series(True, index=df_w.index)
-    )
-    m_val_ok = pd.Series(True, index=df_w.index)
-
-    if filter_mode == "按各项目 SPEC 范围过滤":
-      m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
-    elif (
-        filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
-        and custom_min is not None
-        and custom_max is not None
-    ):
-      m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
-          df_w["_Row_Mean_"] <= custom_max
-      )
-
-    v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
-    df_c = df_w[v_mask].copy().reset_index(drop=True)
-    df_r = df_raw[~v_mask].copy().reset_index(drop=True)
-
-    s_mat_raw = df_c[proj_cols].to_numpy(dtype=float)
-    v_vals_raw = s_mat_raw[~np.isnan(s_mat_raw)]
-    if len(v_vals_raw) < 2:
-      return None
-
-    orig_m = float(np.mean(v_vals_raw))
-    orig_wi = compute_within_std(s_mat_raw, v_vals_raw)
-
-    apply_tuning = enable_sigma_tuning and (
-        sigma_target_proj == "当前聚焦项目" and p_name == current_focus_proj
-        or sigma_target_proj == p_name
-    )
-
-    if apply_tuning and orig_wi > 0:
-      adj_mean = orig_m + (p_target - orig_m) * (center_align_pct / 100.0)
-      if tuning_mode == "直接指定目标西格玛 (σ)" and manual_target_sigma is not None:
-        tgt_wi = float(manual_target_sigma)
-      else:
-        min_dist = min(p_usl - adj_mean, adj_mean - p_lsl)
-        tgt_wi = (
-            min_dist / (3.0 * target_cpk_goal) if min_dist > 0 else orig_wi
-        )
-      ratio = tgt_wi / orig_wi
-      for c_name in proj_cols:
-        df_c[c_name] = adj_mean + (df_c[c_name] - orig_m) * ratio
-      df_c["_Row_Mean_"] = df_c[proj_cols].mean(axis=1)
-
-    s_mat = df_c[proj_cols].to_numpy(dtype=float)
-    v_vals = s_mat[~np.isnan(s_mat)]
-    s_mean = float(np.mean(v_vals))
-    s_ov = float(np.std(v_vals, ddof=1))
-    s_wi = compute_within_std(s_mat, v_vals)
-    tot_n = len(v_vals)
-
-    cp_v = (p_usl - p_lsl) / (6.0 * s_wi) if s_wi > 0 else np.nan
-    cpl_v = (s_mean - p_lsl) / (3.0 * s_wi) if s_wi > 0 else np.nan
-    cpu_v = (p_usl - s_mean) / (3.0 * s_wi) if s_wi > 0 else np.nan
-    cpk_v = min(cpl_v, cpu_v)
-
-    pp_v = (p_usl - p_lsl) / (6.0 * s_ov) if s_ov > 0 else np.nan
-    ppl_v = (s_mean - p_lsl) / (3.0 * s_ov) if s_ov > 0 else np.nan
-    ppu_v = (p_usl - s_mean) / (3.0 * s_ov) if s_ov > 0 else np.nan
-    ppk_v = min(ppl_v, ppu_v)
-
-    obs_lt = float(np.sum(v_vals < p_lsl)) / tot_n * 1e6
-    obs_gt = float(np.sum(v_vals > p_usl)) / tot_n * 1e6
-    obs_tot = obs_lt + obs_gt
-
-    exp_ov_lt = (
-        stats.norm.cdf((p_lsl - s_mean) / s_ov) * 1e6 if s_ov > 0 else 0.0
-    )
-    exp_ov_gt = (
-        (1.0 - stats.norm.cdf((p_usl - s_mean) / s_ov)) * 1e6 if s_ov > 0 else 0.0
-    )
-    exp_ov_tot = exp_ov_lt + exp_ov_gt
-
-    exp_wi_lt = (
-        stats.norm.cdf((p_lsl - s_mean) / s_wi) * 1e6 if s_wi > 0 else 0.0
-    )
-    exp_wi_gt = (
-        (1.0 - stats.norm.cdf((p_usl - s_mean) / s_wi)) * 1e6 if s_wi > 0 else 0.0
-    )
-    exp_wi_tot = exp_wi_lt + exp_wi_gt
-
-    return {
-        "cols": proj_cols,
-        "lsl": p_lsl,
-        "target": p_target,
-        "usl": p_usl,
-        "df_clean": df_c,
-        "df_removed": df_r,
-        "masked_cells": cell_cnt,
-        "all_valid_vals": v_vals,
-        "total_n": tot_n,
-        "sample_mean": s_mean,
-        "std_overall": s_ov,
-        "std_within": s_wi,
-        "cp": cp_v,
-        "cpl": cpl_v,
-        "cpu": cpu_v,
-        "cpk": cpk_v,
-        "pp": pp_v,
-        "ppl": ppl_v,
-        "ppu": ppu_v,
-        "ppk": ppk_v,
-        "obs_lt_lsl": obs_lt,
-        "obs_gt_usl": obs_gt,
-        "obs_total": obs_tot,
-        "exp_ov_lt_lsl": exp_ov_lt,
-        "exp_ov_gt_usl": exp_ov_gt,
-        "exp_ov_total": exp_ov_tot,
-        "exp_wi_lt_lsl": exp_wi_lt,
-        "exp_wi_gt_usl": exp_wi_gt,
-        "exp_wi_total": exp_wi_tot,
-    }
-
   project_bundles = {}
   for p_name in confirmed_projects:
     pk = f"{dataset_key}::{p_name}"
     sp = specs_map[pk]
     if sp["lsl"] >= sp["usl"]:
       continue
-    b_data = build_project_dataset(
-        p_name, proj_map[p_name], sp["lsl"], sp["target"], sp["usl"]
+    apply_tun_p = enable_sigma_tuning and (
+        sigma_target_proj == "当前聚焦项目" and p_name == current_focus_proj
+        or sigma_target_proj == p_name
+    )
+    b_data = cached_build_v1_bundle(
+        df_raw,
+        tuple(proj_map[p_name]),
+        sp["lsl"],
+        sp["target"],
+        sp["usl"],
+        spike_mode,
+        float(spike_param_val),
+        spike_action,
+        pt_min_val,
+        pt_max_val,
+        exclude_ranges_str,
+        filter_mode,
+        custom_min,
+        custom_max,
+        apply_tun_p,
+        int(center_align_pct),
+        tuning_mode,
+        manual_target_sigma,
+        float(target_cpk_goal),
     )
     if b_data is not None:
+      b_data["fp"] = _bundle_fingerprint(b_data)
       project_bundles[p_name] = b_data
 
   if not project_bundles:
@@ -1440,627 +2604,6 @@ def run_v1_app():
     px_w = int(min(1150, max(620, fw * 85)))
     return fw, fh, px_w
 
-  def render_capability_plot(b, title_str, w_in, h_in):
-    fig = plt.figure(figsize=(w_in, h_in), dpi=170)
-    scale_f = min(w_in / 9.6, h_in / 7.2)
-    font_panel = max(7.2, 8.3 * scale_f)
-    font_title = max(11.5, 13.5 * scale_f)
-
-    gs = fig.add_gridspec(
-        2,
-        3,
-        width_ratios=[1.05, 2.35, 0.95],
-        height_ratios=[3.6, 1.15],
-        wspace=0.06,
-        hspace=0.22,
-    )
-    ax_left = fig.add_subplot(gs[0, 0])
-    ax_mid = fig.add_subplot(gs[0, 1])
-    ax_right = fig.add_subplot(gs[0, 2])
-    ax_bot_left = fig.add_subplot(gs[1, 0])
-    ax_bot_mid = fig.add_subplot(gs[1, 1])
-    ax_bot_right = fig.add_subplot(gs[1, 2])
-    for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
-      ax_tmp.axis("off")
-
-    all_v = b["all_valid_vals"]
-    tot_n = b["total_n"]
-    s_mean = b["sample_mean"]
-    s_ov = b["std_overall"]
-    s_wi = b["std_within"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    bins_count = min(38, max(14, int(np.sqrt(tot_n) * 0.55)))
-    counts, _, _ = ax_mid.hist(
-        all_v,
-        bins=bins_count,
-        density=True,
-        color="#78A2CC",
-        edgecolor="#3A5F85",
-        linewidth=0.55,
-        alpha=0.92,
-    )
-
-    span = max(p_usl - p_lsl, 1e-6)
-    x_min_c = min(p_lsl - 0.18 * span, float(np.min(all_v)) - 0.08 * span)
-    x_max_c = max(p_usl + 0.18 * span, float(np.max(all_v)) + 0.08 * span)
-    x_grid = np.linspace(x_min_c, x_max_c, 500)
-
-    line_ov, line_wi = None, None
-    if s_ov > 1e-12:
-      (line_ov,) = ax_mid.plot(
-          x_grid,
-          stats.norm.pdf(x_grid, s_mean, s_ov),
-          color="#B91C1C",
-          lw=1.8,
-          label="Overall",
-      )
-    if s_wi > 1e-12:
-      (line_wi,) = ax_mid.plot(
-          x_grid,
-          stats.norm.pdf(x_grid, s_mean, s_wi),
-          color="#374151",
-          lw=1.6,
-          ls="--",
-          label="Within",
-      )
-
-    ax_mid.axvline(p_lsl, color="#DC2626", ls="--", lw=1.15)
-    ax_mid.axvline(p_usl, color="#DC2626", ls="--", lw=1.15)
-    ax_mid.axvline(p_target, color="#16A34A", ls=":", lw=1.1)
-
-    y_peak = max(
-        float(np.max(counts)) if len(counts) else 1.0,
-        float(np.max(stats.norm.pdf(x_grid, s_mean, s_wi)))
-        if s_wi > 1e-12
-        else 1.0,
-        1e-6,
-    )
-    ax_mid.set_ylim(0, y_peak * 1.14)
-    ax_mid.set_yticks([])
-    ax_mid.tick_params(axis="x", labelsize=max(7.5, 8.8 * scale_f))
-    ax_mid.grid(True, axis="x", ls=":", alpha=0.45)
-
-    lbl_sz = max(7.5, 8.5 * scale_f)
-    ax_mid.text(
-        p_lsl,
-        y_peak * 1.16,
-        f"LSL\n{p_lsl:.2f}",
-        color="#B91C1C",
-        ha="center",
-        va="bottom",
-        fontsize=lbl_sz,
-        fontweight="bold",
-    )
-    ax_mid.text(
-        p_usl,
-        y_peak * 1.16,
-        f"USL\n{p_usl:.2f}",
-        color="#B91C1C",
-        ha="center",
-        va="bottom",
-        fontsize=lbl_sz,
-        fontweight="bold",
-    )
-    ax_mid.text(
-        p_target,
-        y_peak * 1.16,
-        f"Target\n{p_target:.2f}",
-        color="#15803D",
-        ha="center",
-        va="bottom",
-        fontsize=lbl_sz,
-    )
-
-    left_text = (
-        f"Process Data\n----------------------\n"
-        f"LSL          {p_lsl:.4f}\nTarget       {p_target:.4f}\nUSL          {p_usl:.4f}\n"
-        f"Mean         {s_mean:.4f}\nSample N     {tot_n}\nValid Rows   {len(b['df_clean'])}\n"
-        f"Subgroup     {len(b['cols'])}\nStDev(Ov)    {s_ov:.5f}\nStDev(Wi)    {s_wi:.5f}"
-    )
-    ax_left.text(
-        0.95,
-        0.96,
-        left_text,
-        transform=ax_left.transAxes,
-        va="top",
-        ha="right",
-        fontsize=font_panel,
-        fontfamily="monospace",
-        color="#1E293B",
-    )
-
-    right_text = (
-        f"Overall Capability\n------------------\n"
-        f"Pp        {b['pp']:.2f}\nPPL       {b['ppl']:.2f}\nPPU       {b['ppu']:.2f}\nPpk       {b['ppk']:.2f}\n\n"
-        f"Potential (Within)\n------------------\n"
-        f"Cp        {b['cp']:.2f}\nCPL       {b['cpl']:.2f}\nCPU       {b['cpu']:.2f}\nCpk       {b['cpk']:.2f}"
-    )
-    ax_right.text(
-        0.06,
-        0.96,
-        right_text,
-        transform=ax_right.transAxes,
-        va="top",
-        ha="left",
-        fontsize=font_panel,
-        fontfamily="monospace",
-        color="#1E293B",
-    )
-
-    handles_leg = [h for h in (line_ov, line_wi) if h is not None]
-    if handles_leg:
-      ax_bot_right.legend(
-          handles=handles_leg,
-          loc="upper left",
-          bbox_to_anchor=(0.04, 0.98),
-          fontsize=font_panel,
-      )
-
-    ppm_text = (
-        f"Performance (PPM)        Observed    Exp. Overall    Exp. Within\n"
-        f"----------------------------------------------------------------\n"
-        f"PPM < LSL               {b['obs_lt_lsl']:9.2f}       {b['exp_ov_lt_lsl']:9.2f}      {b['exp_wi_lt_lsl']:9.2f}\n"
-        f"PPM > USL               {b['obs_gt_usl']:9.2f}       {b['exp_ov_gt_usl']:9.2f}      {b['exp_wi_gt_usl']:9.2f}\n"
-        f"Total PPM               {b['obs_total']:9.2f}       {b['exp_ov_total']:9.2f}      {b['exp_wi_total']:9.2f}"
-    )
-    ax_bot_mid.text(
-        0.5,
-        0.92,
-        ppm_text,
-        transform=ax_bot_mid.transAxes,
-        va="top",
-        ha="center",
-        fontsize=max(7.0, font_panel * 0.96),
-        fontfamily="monospace",
-        color="#1E293B",
-        bbox=dict(
-            boxstyle="round,pad=0.4", facecolor="#F8FAFC", edgecolor="#E2E8F0"
-        ),
-    )
-
-    fig.suptitle(
-        title_str,
-        fontsize=font_title,
-        fontweight="bold",
-        y=0.96,
-        fontproperties=FONT_PROP,
-    )
-    plt.subplots_adjust(left=0.025, right=0.975, top=0.835, bottom=0.045)
-    return save_fig_with_border(fig, show_outer_border, use_tight=False)
-
-  def render_box_plot(
-      b,
-      title_str,
-      w_in,
-      h_in,
-      show_outliers=False,
-      show_median_val=False,
-      show_mean_val=False,
-      decimals=4,
-  ):
-    fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-    df_c = b["df_clean"]
-    p_cols = b["cols"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    box_data = [
-        arr if len(arr) > 0 else np.array([p_target], dtype=float)
-        for arr in (df_c[c].dropna().to_numpy(dtype=float) for c in p_cols)
-    ]
-    box_labels = [str(c) for c in p_cols]
-    n_boxes = len(box_data)
-    box_width = 0.42 if n_boxes <= 15 else 0.36
-
-    ax.boxplot(
-        box_data,
-        tick_labels=box_labels,
-        patch_artist=True,
-        showfliers=show_outliers,
-        widths=box_width,
-        boxprops=dict(facecolor="#78A2CC", edgecolor="#2B4C7E", linewidth=1.0),
-        medianprops=dict(color="#111827", linewidth=1.3),
-        whiskerprops=dict(color="#2B4C7E", linewidth=1.0),
-        capprops=dict(color="#2B4C7E", linewidth=1.0),
-    )
-
-    ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
-    ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
-    ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
-
-    width_scale = min(w_in / 11.0, 1.15)
-    if show_median_val or show_mean_val:
-      label_font_size = (
-          (8.2 if n_boxes <= 12 else (7.0 if n_boxes <= 22 else 6.0))
-          * width_scale
-      )
-      x_offset = box_width * 0.54
-      fmt_str = f"{{:.{decimals}f}}"
-
-      y_min_cur, y_max_cur = ax.get_ylim()
-      y_span_cur = max(y_max_cur - y_min_cur, 1e-6)
-
-      for idx, arr in enumerate(box_data):
-        x_pos = (idx + 1) + x_offset
-        med_v = float(np.median(arr)) if show_median_val else None
-        mean_v = float(np.mean(arr)) if show_mean_val else None
-
-        if show_median_val and show_mean_val:
-          min_gap = y_span_cur * 0.032
-          y_med_txt, y_mean_txt = med_v, mean_v
-          if abs(y_mean_txt - y_med_txt) < min_gap:
-            if y_mean_txt >= y_med_txt:
-              y_mean_txt = med_v + min_gap * 0.6
-              y_med_txt = med_v - min_gap * 0.6
-            else:
-              y_mean_txt = med_v - min_gap * 0.6
-              y_med_txt = med_v + min_gap * 0.6
-          ax.text(
-              x_pos,
-              y_med_txt,
-              f"Med:{fmt_str.format(med_v)}",
-              va="center",
-              ha="left",
-              fontsize=label_font_size,
-              color="#1F2937",
-          )
-          ax.text(
-              x_pos,
-              y_mean_txt,
-              f"Avg:{fmt_str.format(mean_v)}",
-              va="center",
-              ha="left",
-              fontsize=label_font_size,
-              color="#1D4ED8",
-          )
-        elif show_median_val:
-          ax.text(
-              x_pos,
-              med_v,
-              fmt_str.format(med_v),
-              va="center",
-              ha="left",
-              fontsize=label_font_size,
-              color="#1F2937",
-          )
-        elif show_mean_val:
-          ax.text(
-              x_pos,
-              mean_v,
-              fmt_str.format(mean_v),
-              va="center",
-              ha="left",
-              fontsize=label_font_size,
-              color="#1D4ED8",
-          )
-
-      ax.set_xlim(0.4, n_boxes + 1.05)
-
-    ax_r = ax.twinx()
-    ax_r.set_ylim(ax.get_ylim())
-    ax_r.set_yticks([p_lsl, p_target, p_usl])
-    ax_r.set_yticklabels(
-        [f"{p_lsl}", f"{p_target}", f"{p_usl}"],
-        color="#B91C1C",
-        fontsize=8.8,
-        fontweight="bold",
-    )
-
-    ax.set_title(
-        title_str,
-        fontsize=max(11.5, 13.5 * width_scale),
-        fontweight="bold",
-        pad=12,
-        fontproperties=FONT_PROP,
-    )
-    ax.set_ylabel("Value", fontsize=10)
-    ax.tick_params(
-        axis="x", rotation=45 if len(box_labels) > 5 else 0, labelsize=8.8
-    )
-    for lbl in ax.get_xticklabels():
-      lbl.set_fontproperties(FONT_PROP)
-    ax.grid(True, ls=":", alpha=0.45)
-    plt.tight_layout(pad=1.2)
-    return save_fig_with_border(fig, show_outer_border, use_tight=False)
-
-  def render_time_series_plot(
-      b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
-  ):
-    fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-    df_c = b["df_clean"]
-    p_cols = b["cols"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    if x_mode_opt == "保留原始表格行号 (Row Index)":
-      x_seq = df_c["Row_Index"].to_numpy(dtype=int)
-      x_label_text = "Original Row Index"
-    else:
-      x_seq = np.arange(1, len(df_c) + 1)
-      x_label_text = "Filtered Sequence Index (1..N)"
-
-    markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
-    cmap = plt.get_cmap("tab20")
-    step_mark = max(1, len(x_seq) // 250)
-
-    for idx, col_name in enumerate(p_cols):
-      y_col = df_c[col_name].to_numpy(dtype=float)
-      ax.plot(
-          x_seq,
-          y_col,
-          color=cmap(idx % 20),
-          lw=1.1,
-          marker=markers[idx % len(markers)],
-          markersize=3.2,
-          markevery=step_mark,
-          alpha=0.85,
-          label=str(col_name),
-      )
-
-    ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
-    ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
-    ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
-
-    if (
-        y_mode_opt == "自定义范围 (Manual)"
-        and ymin_val is not None
-        and ymax_val is not None
-        and ymin_val < ymax_val
-    ):
-      ax.set_ylim(ymin_val, ymax_val)
-
-    width_scale = min(w_in / 11.0, 1.15)
-    ax.set_title(
-        title_str,
-        fontsize=max(11.5, 13.5 * width_scale),
-        fontweight="bold",
-        pad=12,
-        fontproperties=FONT_PROP,
-    )
-    ax.set_xlabel(x_label_text, fontsize=10)
-    ax.set_ylabel("Value", fontsize=10)
-    ax.grid(True, ls=":", alpha=0.45)
-
-    handles, labels_ts = ax.get_legend_handles_labels()
-    if w_in / h_in < 1.55:
-      n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
-      ax.legend(
-          handles[:20],
-          labels_ts[:20],
-          loc="upper center",
-          bbox_to_anchor=(0.5, -0.15),
-          ncol=n_cols_leg,
-          prop=FONT_PROP,
-          fontsize=7.6,
-          frameon=True,
-      )
-    else:
-      leg = ax.legend(
-          handles[:20],
-          labels_ts[:20],
-          title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
-          bbox_to_anchor=(1.02, 1),
-          loc="upper left",
-          prop=FONT_PROP,
-          fontsize=8.0,
-      )
-      leg.get_title().set_fontsize(8.8)
-
-    plt.tight_layout(pad=1.0)
-    return save_fig_with_border(fig, show_outer_border, use_tight=True)
-
-  def render_scatter_series_plot(
-      b,
-      title_str,
-      w_in,
-      h_in,
-      x_mode_opt,
-      y_mode_opt,
-      ymin_val=None,
-      ymax_val=None,
-      point_size=None,
-  ):
-    fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-    df_c = b["df_clean"]
-    p_cols = b["cols"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    if x_mode_opt == "保留原始表格行号 (Row Index)":
-      x_seq = df_c["Row_Index"].to_numpy(dtype=int)
-      x_label_text = "Original Row Index"
-    else:
-      x_seq = np.arange(1, len(df_c) + 1)
-      x_label_text = "Filtered Sequence Index (1..N)"
-
-    n_pts = len(x_seq)
-    if point_size is None:
-      if n_pts > 5000:
-        pt_s = 4.5
-      elif n_pts > 1500:
-        pt_s = 7.0
-      else:
-        pt_s = 11.0
-    else:
-      pt_s = float(point_size)
-
-    markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
-    cmap = plt.get_cmap("tab20")
-
-    for idx, col_name in enumerate(p_cols):
-      y_col = df_c[col_name].to_numpy(dtype=float)
-      ax.scatter(
-          x_seq,
-          y_col,
-          color=cmap(idx % 20),
-          marker=markers[idx % len(markers)],
-          s=pt_s,
-          alpha=0.72,
-          edgecolors="none",
-          label=str(col_name),
-      )
-
-    ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
-    ax.axhline(p_target, color="#DC2626", ls="--", lw=1.0, alpha=0.75)
-    ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
-
-    if (
-        y_mode_opt == "自定义范围 (Manual)"
-        and ymin_val is not None
-        and ymax_val is not None
-        and ymin_val < ymax_val
-    ):
-      ax.set_ylim(ymin_val, ymax_val)
-
-    width_scale = min(w_in / 11.0, 1.15)
-    ax.set_title(
-        title_str,
-        fontsize=max(11.5, 13.5 * width_scale),
-        fontweight="bold",
-        pad=12,
-        fontproperties=FONT_PROP,
-    )
-    ax.set_xlabel(x_label_text, fontsize=10)
-    ax.set_ylabel("Value", fontsize=10)
-    ax.grid(True, ls=":", alpha=0.45)
-
-    handles, labels_sc = ax.get_legend_handles_labels()
-    if w_in / h_in < 1.55:
-      n_cols_leg = min(5, max(3, len(handles[:20]) // 3))
-      ax.legend(
-          handles[:20],
-          labels_sc[:20],
-          loc="upper center",
-          bbox_to_anchor=(0.5, -0.15),
-          ncol=n_cols_leg,
-          prop=FONT_PROP,
-          fontsize=7.6,
-          frameon=True,
-      )
-    else:
-      leg = ax.legend(
-          handles[:20],
-          labels_sc[:20],
-          title="Variables" if len(handles) <= 20 else "Variables (Top 20)",
-          bbox_to_anchor=(1.02, 1),
-          loc="upper left",
-          prop=FONT_PROP,
-          fontsize=8.0,
-      )
-      leg.get_title().set_fontsize(8.8)
-
-    plt.tight_layout(pad=1.0)
-    return save_fig_with_border(fig, show_outer_border, use_tight=True)
-
-  def render_excel_style_row_mean_plot(
-      b, title_str, w_in, h_in, x_mode_opt, y_mode_opt, ymin_val=None, ymax_val=None
-  ):
-    fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=170)
-    ax.set_facecolor("white")
-    df_c = b["df_clean"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    if x_mode_opt == "保留原始表格行号 (Row Index)":
-      x_seq = df_c["Row_Index"].to_numpy(dtype=int)
-    else:
-      x_seq = np.arange(1, len(df_c) + 1)
-
-    y_mean_series = df_c["_Row_Mean_"].to_numpy(dtype=float)
-
-    ax.plot(
-        x_seq,
-        np.full_like(x_seq, p_target, dtype=float),
-        color="#4472C4",
-        lw=2.5,
-        label="目标值",
-    )
-    ax.plot(
-        x_seq,
-        np.full_like(x_seq, p_usl, dtype=float),
-        color="#ED7D31",
-        lw=2.5,
-        label="规格上限",
-    )
-    ax.plot(
-        x_seq,
-        np.full_like(x_seq, p_lsl, dtype=float),
-        color="#A5A5A5",
-        lw=2.5,
-        label="规格下限",
-    )
-    ax.plot(
-        x_seq,
-        y_mean_series,
-        color="#FFC000",
-        lw=2.2,
-        label="平均值",
-    )
-
-    if (
-        y_mode_opt == "自定义范围 (Manual)"
-        and ymin_val is not None
-        and ymax_val is not None
-        and ymin_val < ymax_val
-    ):
-      ax.set_ylim(ymin_val, ymax_val)
-    else:
-      spec_span = max(p_usl - p_lsl, 1e-6)
-      y_low = min(
-          p_lsl - 0.5 * spec_span,
-          float(np.min(y_mean_series)) - 0.15 * spec_span,
-      )
-      y_high = max(
-          p_usl + 0.25 * spec_span,
-          float(np.max(y_mean_series)) + 0.15 * spec_span,
-      )
-      ax.set_ylim(y_low, y_high)
-
-    if len(x_seq) >= 2 and x_seq[-1] > x_seq[0]:
-      ax.set_xlim(x_seq[0], x_seq[-1])
-
-    if len(x_seq) > 1:
-      n_ticks = max(12, int(w_in * 2.1))
-      tick_step = max(1, len(x_seq) // n_ticks)
-      tick_positions = x_seq[::tick_step]
-      ax.set_xticks(tick_positions)
-      ax.set_xticklabels(
-          [str(v) for v in tick_positions],
-          rotation=90,
-          fontsize=9.0,
-          color="#595959",
-      )
-
-    ax.tick_params(axis="y", labelsize=9.5, colors="#595959", length=0)
-    ax.tick_params(axis="x", length=0, pad=5)
-    ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color="#D9D9D9")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(False)
-
-    width_scale = min(w_in / 10.5, 1.15)
-    ax.set_title(
-        title_str,
-        fontsize=max(13.5, 16.5 * width_scale),
-        fontweight="normal",
-        color="#595959",
-        pad=16,
-        fontproperties=FONT_PROP,
-    )
-
-    leg = ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.14),
-        ncol=4,
-        frameon=False,
-        prop=FONT_PROP,
-        fontsize=10.5,
-        handlelength=2.2,
-        columnspacing=1.8,
-    )
-    for text in leg.get_texts():
-      text.set_color("#595959")
-
-    plt.tight_layout(pad=1.0)
-    return save_fig_with_border(fig, show_outer_border, use_tight=True)
-
   summary_rows = []
   for p_name in ready_projects:
     b = project_bundles[p_name]
@@ -2080,53 +2623,114 @@ def run_v1_app():
     })
   st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
 
+  # 按需打包 ZIP（不再每次刷新自动重绘所有项目图片）
   if len(ready_projects) > 1:
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-      for p_name in ready_projects:
-        b = project_bundles[p_name]
-        t_cap, t_box, t_ts, t_sc, t_mean = get_project_titles(p_name)
-        safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
-        zf.writestr(
-            f"{safe_p}/{safe_p}_CPK.png",
-            render_capability_plot(b, t_cap, 9.6, 7.2).getvalue(),
-        )
-        zf.writestr(
-            f"{safe_p}/{safe_p}_BoxPlot.png",
-            render_box_plot(b, t_box, 9.6, 7.2).getvalue(),
-        )
-        zf.writestr(
-            f"{safe_p}/{safe_p}_TimeSeries.png",
-            render_time_series_plot(
-                b, t_ts, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
-            ).getvalue(),
-        )
-        zf.writestr(
-            f"{safe_p}/{safe_p}_ScatterSeries.png",
-            render_scatter_series_plot(
-                b, t_sc, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
-            ).getvalue(),
-        )
-        zf.writestr(
-            f"{safe_p}/{safe_p}_RowMean_Trend.png",
-            render_excel_style_row_mean_plot(
-                b, t_mean, 13.6, 6.2, "连续重排序号 (1..N，无断层)", "自动缩放 (Auto)"
-            ).getvalue(),
-        )
-    zip_buf.seek(0)
-    safe_sheet = re.sub(r'[\\/*?:"<>|]', "_", selected_sheet)
-    st.download_button(
-        "下载",
-        data=zip_buf,
-        file_name=f"{safe_sheet}_多项目SPC图表包.zip",
-        mime="application/zip",
-        key=f"v1_dl_zip_{dataset_key}",
+    zip_state_key = f"v1_zip_bytes_{dataset_key}"
+    zip_sig_key = f"v1_zip_sig_{dataset_key}"
+    cur_zip_sig = (
+        "|".join(f"{pn}:{project_bundles[pn]['fp']}" for pn in ready_projects)
+        + f"|border={show_outer_border}"
     )
+    if st.button(
+        "📦 打包生成多项目 SPC 图表 ZIP",
+        key=f"v1_prep_zip_{dataset_key}",
+    ):
+      zip_buf = io.BytesIO()
+      with zipfile.ZipFile(
+          zip_buf, "w", compression=zipfile.ZIP_DEFLATED
+      ) as zf:
+        for p_name in ready_projects:
+          b = project_bundles[p_name]
+          t_cap, t_box, t_ts, t_sc, t_mean = get_project_titles(p_name)
+          safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
+          zf.writestr(
+              f"{safe_p}/{safe_p}_CPK.png",
+              cached_capability_png(
+                  b["fp"], b, t_cap, 9.6, 7.2, show_outer_border
+              ),
+          )
+          zf.writestr(
+              f"{safe_p}/{safe_p}_BoxPlot.png",
+              cached_box_png(
+                  b["fp"],
+                  b,
+                  t_box,
+                  9.6,
+                  7.2,
+                  False,
+                  False,
+                  False,
+                  4,
+                  show_outer_border,
+              ),
+          )
+          zf.writestr(
+              f"{safe_p}/{safe_p}_TimeSeries.png",
+              cached_time_series_png(
+                  b["fp"],
+                  b,
+                  t_ts,
+                  13.6,
+                  6.2,
+                  "连续重排序号 (1..N，无断层)",
+                  "自动缩放 (Auto)",
+                  None,
+                  None,
+                  show_outer_border,
+              ),
+          )
+          zf.writestr(
+              f"{safe_p}/{safe_p}_ScatterSeries.png",
+              cached_scatter_series_png(
+                  b["fp"],
+                  b,
+                  t_sc,
+                  13.6,
+                  6.2,
+                  "连续重排序号 (1..N，无断层)",
+                  "自动缩放 (Auto)",
+                  None,
+                  None,
+                  None,
+                  show_outer_border,
+              ),
+          )
+          zf.writestr(
+              f"{safe_p}/{safe_p}_RowMean_Trend.png",
+              cached_row_mean_png(
+                  b["fp"],
+                  b,
+                  t_mean,
+                  13.6,
+                  6.2,
+                  "连续重排序号 (1..N，无断层)",
+                  "自动缩放 (Auto)",
+                  None,
+                  None,
+                  show_outer_border,
+              ),
+          )
+      st.session_state[zip_state_key] = zip_buf.getvalue()
+      st.session_state[zip_sig_key] = cur_zip_sig
+
+    if (
+        st.session_state.get(zip_state_key)
+        and st.session_state.get(zip_sig_key) == cur_zip_sig
+    ):
+      safe_sheet = re.sub(r'[\\/*?:"<>|]', "_", selected_sheet)
+      st.download_button(
+          "下载 ZIP 包",
+          data=st.session_state[zip_state_key],
+          file_name=f"{safe_sheet}_多项目SPC图表包.zip",
+          mime="application/zip",
+          key=f"v1_dl_zip_{dataset_key}",
+      )
 
   proj_tabs = st.tabs([f"📊 {p_name}" for p_name in ready_projects])
   for p_tab, p_name in zip(proj_tabs, ready_projects):
     with p_tab:
       b = project_bundles[p_name]
+      bfp = b["fp"]
       t_cap, t_box, t_ts, t_sc, t_mean = get_project_titles(p_name)
       safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", p_name)
       all_v = b["all_valid_vals"]
@@ -2146,10 +2750,12 @@ def run_v1_app():
         cap_w, cap_h, cap_px = render_aspect_selector(
             cc1, f"cap_{p_name}", default_idx=0
         )
-        buf_cap = render_capability_plot(b, t_cap, cap_w, cap_h)
-        st.image(buf_cap, width=cap_px)
+        png_cap = cached_capability_png(
+            bfp, b, t_cap, cap_w, cap_h, show_outer_border
+        )
+        st.image(png_cap, width=cap_px)
         render_chart_action_bar(
-            buf_cap, f"{safe_prefix}_CPK.png", f"v1_cap_{dataset_key}_{p_name}"
+            png_cap, f"{safe_prefix}_CPK.png", f"v1_cap_{dataset_key}_{p_name}"
         )
 
       with tab_box:
@@ -2179,19 +2785,21 @@ def run_v1_app():
             bc5, f"box_{p_name}", default_idx=0
         )
 
-        buf_box = render_box_plot(
+        png_box = cached_box_png(
+            bfp,
             b,
             t_box,
             box_w,
             box_h,
-            show_outliers=show_box_outliers,
-            show_median_val=show_box_median,
-            show_mean_val=show_box_mean,
-            decimals=box_decimals,
+            show_box_outliers,
+            show_box_median,
+            show_box_mean,
+            box_decimals,
+            show_outer_border,
         )
-        st.image(buf_box, width=box_px)
+        st.image(png_box, width=box_px)
         render_chart_action_bar(
-            buf_box,
+            png_box,
             f"{safe_prefix}_BoxPlot.png",
             f"v1_box_{dataset_key}_{p_name}",
         )
@@ -2230,12 +2838,21 @@ def run_v1_app():
             tc5, f"ts_{p_name}", default_idx=3
         )
 
-        buf_ts = render_time_series_plot(
-            b, t_ts, ts_w, ts_h, ts_x_mode, ts_y_mode, ts_ymin, ts_ymax
+        png_ts = cached_time_series_png(
+            bfp,
+            b,
+            t_ts,
+            ts_w,
+            ts_h,
+            ts_x_mode,
+            ts_y_mode,
+            ts_ymin,
+            ts_ymax,
+            show_outer_border,
         )
-        st.image(buf_ts, width=ts_px)
+        st.image(png_ts, width=ts_px)
         render_chart_action_bar(
-            buf_ts,
+            png_ts,
             f"{safe_prefix}_TimeSeries.png",
             f"v1_ts_{dataset_key}_{p_name}",
         )
@@ -2284,7 +2901,8 @@ def run_v1_app():
             sc6, f"sc_{p_name}", default_idx=3
         )
 
-        buf_sc = render_scatter_series_plot(
+        png_sc = cached_scatter_series_png(
+            bfp,
             b,
             t_sc,
             sc_w,
@@ -2293,11 +2911,12 @@ def run_v1_app():
             sc_y_mode,
             sc_ymin,
             sc_ymax,
-            point_size=sc_pt_size,
+            sc_pt_size,
+            show_outer_border,
         )
-        st.image(buf_sc, width=sc_px)
+        st.image(png_sc, width=sc_px)
         render_chart_action_bar(
-            buf_sc,
+            png_sc,
             f"{safe_prefix}_ScatterSeries.png",
             f"v1_sc_{dataset_key}_{p_name}",
         )
@@ -2335,12 +2954,21 @@ def run_v1_app():
             mc5, f"mean_{p_name}", default_idx=3
         )
 
-        buf_mean = render_excel_style_row_mean_plot(
-            b, t_mean, mean_w, mean_h, mean_x_mode, mean_y_mode, mean_ymin, mean_ymax
+        png_mean = cached_row_mean_png(
+            bfp,
+            b,
+            t_mean,
+            mean_w,
+            mean_h,
+            mean_x_mode,
+            mean_y_mode,
+            mean_ymin,
+            mean_ymax,
+            show_outer_border,
         )
-        st.image(buf_mean, width=mean_px)
+        st.image(png_mean, width=mean_px)
         render_chart_action_bar(
-            buf_mean,
+            png_mean,
             f"{safe_prefix}_RowMean_Trend.png",
             f"v1_mean_{dataset_key}_{p_name}",
         )
@@ -2406,6 +3034,7 @@ def run_v2_app():
           unsafe_allow_html=True,
       )
 
+  @st.cache_data(show_spinner=False)
   def prepare_clean_raw_df(raw_sheet_df):
     df_w = raw_sheet_df.dropna(how="all").reset_index(drop=True).copy()
     if df_w.empty:
@@ -3029,196 +3658,6 @@ def run_v2_app():
           key=f"v2_tgt_cpk_{dataset_key}",
       )
 
-  def _finalize_bundle_from_df(
-      df_c, df_r, cell_cnt, batch_label, valid_cols, p_name, p_lsl, p_target, p_usl
-  ):
-    s_mat_raw = df_c[valid_cols].to_numpy(dtype=float)
-    v_vals_raw = s_mat_raw[~np.isnan(s_mat_raw)]
-    if len(v_vals_raw) < 2:
-      return None
-
-    orig_m = float(np.mean(v_vals_raw))
-    orig_wi = compute_within_std(s_mat_raw, v_vals_raw)
-
-    proj_match = (
-        sigma_target_proj == "当前聚焦项目" and p_name == current_focus_proj
-    ) or (sigma_target_proj == p_name)
-    batch_match = (sigma_target_batch == "全部对比批次") or (
-        sigma_target_batch == batch_label
-    )
-
-    if enable_sigma_tuning and proj_match and batch_match and orig_wi > 0:
-      adj_mean = orig_m + (p_target - orig_m) * (center_align_pct / 100.0)
-      if tuning_mode == "直接指定目标西格玛 (σ)" and manual_target_sigma is not None:
-        tgt_wi = float(manual_target_sigma)
-      else:
-        min_dist = min(p_usl - adj_mean, adj_mean - p_lsl)
-        tgt_wi = (
-            min_dist / (3.0 * target_cpk_goal) if min_dist > 0 else orig_wi
-        )
-      ratio = tgt_wi / orig_wi
-      for c_name in valid_cols:
-        df_c[c_name] = adj_mean + (df_c[c_name] - orig_m) * ratio
-      df_c["_Row_Mean_"] = df_c[valid_cols].mean(axis=1)
-
-    s_mat = df_c[valid_cols].to_numpy(dtype=float)
-    v_vals = s_mat[~np.isnan(s_mat)]
-    s_mean = float(np.mean(v_vals))
-    s_ov = float(np.std(v_vals, ddof=1))
-    s_wi = compute_within_std(s_mat, v_vals)
-    tot_n = len(v_vals)
-
-    cp_v = (p_usl - p_lsl) / (6.0 * s_wi) if s_wi > 0 else np.nan
-    cpl_v = (s_mean - p_lsl) / (3.0 * s_wi) if s_wi > 0 else np.nan
-    cpu_v = (p_usl - s_mean) / (3.0 * s_wi) if s_wi > 0 else np.nan
-    cpk_v = min(cpl_v, cpu_v)
-
-    pp_v = (p_usl - p_lsl) / (6.0 * s_ov) if s_ov > 0 else np.nan
-    ppl_v = (s_mean - p_lsl) / (3.0 * s_ov) if s_ov > 0 else np.nan
-    ppu_v = (p_usl - s_mean) / (3.0 * s_ov) if s_ov > 0 else np.nan
-    ppk_v = min(ppl_v, ppu_v)
-
-    obs_lt = float(np.sum(v_vals < p_lsl)) / tot_n * 1e6
-    obs_gt = float(np.sum(v_vals > p_usl)) / tot_n * 1e6
-    obs_tot = obs_lt + obs_gt
-
-    exp_ov_lt = (
-        stats.norm.cdf((p_lsl - s_mean) / s_ov) * 1e6 if s_ov > 0 else 0.0
-    )
-    exp_ov_gt = (
-        (1.0 - stats.norm.cdf((p_usl - s_mean) / s_ov)) * 1e6 if s_ov > 0 else 0.0
-    )
-    exp_ov_tot = exp_ov_lt + exp_ov_gt
-
-    exp_wi_lt = (
-        stats.norm.cdf((p_lsl - s_mean) / s_wi) * 1e6 if s_wi > 0 else 0.0
-    )
-    exp_wi_gt = (
-        (1.0 - stats.norm.cdf((p_usl - s_mean) / s_wi)) * 1e6 if s_wi > 0 else 0.0
-    )
-    exp_wi_tot = exp_wi_lt + exp_wi_gt
-
-    return {
-        "batch_label": batch_label,
-        "cols": valid_cols,
-        "lsl": p_lsl,
-        "target": p_target,
-        "usl": p_usl,
-        "df_clean": df_c,
-        "df_removed": df_r,
-        "masked_cells": cell_cnt,
-        "all_valid_vals": v_vals,
-        "total_n": tot_n,
-        "sample_mean": s_mean,
-        "std_overall": s_ov,
-        "std_within": s_wi,
-        "cp": cp_v,
-        "cpl": cpl_v,
-        "cpu": cpu_v,
-        "cpk": cpk_v,
-        "pp": pp_v,
-        "ppl": ppl_v,
-        "ppu": ppu_v,
-        "ppk": ppk_v,
-        "obs_lt_lsl": obs_lt,
-        "obs_gt_usl": obs_gt,
-        "obs_total": obs_tot,
-        "exp_ov_lt_lsl": exp_ov_lt,
-        "exp_ov_gt_usl": exp_ov_gt,
-        "exp_ov_total": exp_ov_tot,
-        "exp_wi_lt_lsl": exp_wi_lt,
-        "exp_wi_gt_usl": exp_wi_gt,
-        "exp_wi_total": exp_wi_tot,
-    }
-
-  def prefilter_batch_project_df(
-      df_src, batch_label, p_name, proj_cols, p_lsl, p_target, p_usl
-  ):
-    valid_cols = [c for c in proj_cols if c in df_src.columns]
-    if not valid_cols:
-      return None
-
-    excl_set = parse_exclude_indices(exclude_ranges_str, len(df_src))
-    df_w = df_src.copy()
-    sub_raw = df_w[valid_cols].to_numpy(dtype=float)
-    sp_mask = np.zeros_like(sub_raw, dtype=bool)
-
-    if spike_mode != "不启用单点屏蔽":
-      if spike_mode == "智能抗差识别（偏离中位数 N 倍 MAD）":
-        v_flat = sub_raw[~np.isnan(sub_raw)]
-        if len(v_flat) > 0:
-          med_v = float(np.median(v_flat))
-          mad_v = float(np.median(np.abs(v_flat - med_v)))
-          r_sig = mad_v * 1.4826
-          if r_sig <= 1e-12:
-            q75, q25 = np.percentile(v_flat, [75, 25])
-            r_sig = max((q75 - q25) / 1.349, (p_usl - p_lsl) / 6.0, 1e-6)
-          low_b = med_v - spike_param_val * r_sig
-          high_b = med_v + spike_param_val * r_sig
-          sp_mask = (~np.isnan(sub_raw)) & (
-              (sub_raw < low_b) | (sub_raw > high_b)
-          )
-      elif spike_mode == "按各项目 SPEC 公差倍数识别":
-        sp_span = p_usl - p_lsl
-        low_b = p_target - spike_param_val * sp_span
-        high_b = p_target + spike_param_val * sp_span
-        sp_mask = (~np.isnan(sub_raw)) & (
-            (sub_raw < low_b) | (sub_raw > high_b)
-        )
-      elif (
-          spike_mode == "自定义单点有效数值区间"
-          and pt_min_val is not None
-          and pt_max_val is not None
-      ):
-        sp_mask = (~np.isnan(sub_raw)) & (
-            (sub_raw < pt_min_val) | (sub_raw > pt_max_val)
-        )
-
-    cell_cnt = int(np.sum(sp_mask))
-    row_has_sp = np.any(sp_mask, axis=1)
-
-    if cell_cnt > 0 and spike_action == "置空该单元格（保留行内其他列）":
-      cleaned = sub_raw.copy()
-      cleaned[sp_mask] = np.nan
-      for idx_c, c_name in enumerate(valid_cols):
-        df_w[c_name] = cleaned[:, idx_c]
-
-    df_w["_Row_Mean_"] = df_w[valid_cols].mean(axis=1)
-
-    m_not_nan = df_w["_Row_Mean_"].notna()
-    m_not_rng = ~df_w["Row_Index"].isin(excl_set)
-    m_no_sp_row = (
-        pd.Series(~row_has_sp, index=df_w.index)
-        if (cell_cnt > 0 and spike_action == "剔除包含异常点的整行")
-        else pd.Series(True, index=df_w.index)
-    )
-    m_val_ok = pd.Series(True, index=df_w.index)
-
-    if filter_mode == "按各项目 SPEC 范围过滤":
-      m_val_ok = (df_w["_Row_Mean_"] >= p_lsl) & (df_w["_Row_Mean_"] <= p_usl)
-    elif (
-        filter_mode == "按自定义范围过滤（超出设定区间屏蔽）"
-        and custom_min is not None
-        and custom_max is not None
-    ):
-      m_val_ok = (df_w["_Row_Mean_"] >= custom_min) & (
-          df_w["_Row_Mean_"] <= custom_max
-      )
-
-    v_mask = m_not_nan & m_not_rng & m_no_sp_row & m_val_ok
-    df_c = df_w[v_mask].copy().reset_index(drop=True)
-    df_r = df_src[~v_mask].copy().reset_index(drop=True)
-    if len(df_c) < 2:
-      return None
-
-    return {
-        "batch_label": batch_label,
-        "valid_cols": valid_cols,
-        "df_clean": df_c,
-        "df_removed": df_r,
-        "masked_cells": cell_cnt,
-    }
-
   bundles_by_project = {}
   for p_name in confirmed_projects:
     pk = f"{dataset_key}::{p_name}"
@@ -3228,14 +3667,22 @@ def run_v2_app():
 
     stage1_map = {}
     for b_entry in batch_entries:
-      pre = prefilter_batch_project_df(
+      pre = cached_prefilter_v2_batch(
           b_entry["df_raw"],
           b_entry["label"],
-          p_name,
-          proj_map[p_name],
+          tuple(proj_map[p_name]),
           sp["lsl"],
           sp["target"],
           sp["usl"],
+          spike_mode,
+          float(spike_param_val),
+          spike_action,
+          pt_min_val,
+          pt_max_val,
+          exclude_ranges_str,
+          filter_mode,
+          custom_min,
+          custom_max,
       )
       if pre is not None:
         stage1_map[b_entry["label"]] = pre
@@ -3264,18 +3711,31 @@ def run_v2_app():
           [pre["df_removed"], df_c_sub[~keep_mask]], ignore_index=True
       )
 
-      b_obj = _finalize_bundle_from_df(
+      proj_match = (
+          sigma_target_proj == "当前聚焦项目" and p_name == current_focus_proj
+      ) or (sigma_target_proj == p_name)
+      batch_match = (sigma_target_batch == "全部对比批次") or (
+          sigma_target_batch == b_lbl
+      )
+      apply_tun_b = bool(enable_sigma_tuning and proj_match and batch_match)
+
+      b_obj = _compute_spc_metrics_from_clean(
           df_c_final,
           df_r_final,
           pre["masked_cells"],
-          b_lbl,
           pre["valid_cols"],
-          p_name,
           sp["lsl"],
           sp["target"],
           sp["usl"],
+          apply_tun_b,
+          int(center_align_pct),
+          tuning_mode,
+          manual_target_sigma,
+          float(target_cpk_goal),
+          extra_meta={"batch_label": b_lbl},
       )
       if b_obj is not None:
+        b_obj["fp"] = _bundle_fingerprint(b_obj)
         p_batch_map[b_lbl] = b_obj
 
     if p_batch_map:
@@ -3288,7 +3748,7 @@ def run_v2_app():
     st.stop()
 
   ready_projects = list(bundles_by_project.keys())
-  batch_labels_all = [b["label"] for b in batch_entries]
+  batch_labels_all = tuple(b["label"] for b in batch_entries)
   render_v2_header(compact=True)
 
   top_bar1, top_bar2 = st.columns([3.5, 1.2])
@@ -3330,518 +3790,6 @@ def run_v2_app():
         key=f"v2_show_border_{dataset_key}",
     )
 
-  BATCH_COLORS = ["#6495ED", "#E07A7A", "#34A853", "#9B6BDF", "#F29900"]
-  BATCH_EDGE_COLORS = ["#3B5998", "#A8383B", "#1E7E34", "#5E35B1", "#B06000"]
-
-  def render_grouped_histogram_plot(
-      p_name,
-      p_batch_dict,
-      title_str,
-      bins_num=22,
-      y_metric="频数 (Count)",
-      show_normal_fit=True,
-      show_spec_lines=True,
-  ):
-    active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
-    first_b = p_batch_dict[active_labels[0]]
-    p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
-
-    fig, ax = plt.subplots(figsize=(11.5, 5.8), dpi=170)
-    ax.set_facecolor("white")
-
-    all_concat = np.concatenate(
-        [p_batch_dict[lbl]["all_valid_vals"] for lbl in active_labels]
-    )
-    x_min_d, x_max_d = float(np.min(all_concat)), float(np.max(all_concat))
-    if x_max_d <= x_min_d:
-      x_max_d = x_min_d + 1.0
-    bin_edges = np.linspace(x_min_d, x_max_d, int(bins_num) + 1)
-    bin_width = bin_edges[1] - bin_edges[0]
-    is_density = "密度" in y_metric
-
-    max_y_val = 1.0
-    x_curve = np.linspace(
-        min(x_min_d, p_lsl if show_spec_lines else x_min_d) - 0.5 * bin_width,
-        max(x_max_d, p_usl if show_spec_lines else x_max_d) + 0.5 * bin_width,
-        400,
-    )
-
-    for idx, lbl in enumerate(active_labels):
-      b = p_batch_dict[lbl]
-      vals = b["all_valid_vals"]
-      col_fill = BATCH_COLORS[idx % len(BATCH_COLORS)]
-      col_edge = BATCH_EDGE_COLORS[idx % len(BATCH_EDGE_COLORS)]
-
-      counts_arr, _, _ = ax.hist(
-          vals,
-          bins=bin_edges,
-          density=is_density,
-          color=col_fill,
-          edgecolor=col_edge,
-          linewidth=0.75,
-          alpha=0.46,
-          label=f"{lbl} (N={len(vals)}, μ={b['sample_mean']:.3f})",
-      )
-      if len(counts_arr) > 0:
-        max_y_val = max(max_y_val, float(np.max(counts_arr)))
-
-      if show_normal_fit and len(vals) >= 2:
-        mu_v = float(np.mean(vals))
-        sd_v = float(np.std(vals, ddof=1))
-        if sd_v > 1e-12:
-          pdf_y = stats.norm.pdf(x_curve, mu_v, sd_v)
-          curve_y = pdf_y if is_density else pdf_y * len(vals) * bin_width
-          max_y_val = max(max_y_val, float(np.max(curve_y)))
-          ax.plot(
-              x_curve,
-              curve_y,
-              color=col_edge,
-              lw=1.8,
-              ls="-",
-              alpha=0.92,
-              label=f"{lbl} 正态拟合 (σ={sd_v:.4f})",
-          )
-
-    if show_spec_lines:
-      ax.axvline(
-          p_lsl, color="#DC2626", ls="--", lw=1.25, label=f"LSL ({p_lsl})"
-      )
-      ax.axvline(
-          p_target,
-          color="#16A34A",
-          ls="-.",
-          lw=1.1,
-          label=f"Target ({p_target})",
-      )
-      ax.axvline(
-          p_usl, color="#DC2626", ls="--", lw=1.25, label=f"USL ({p_usl})"
-      )
-
-    ax.set_ylim(0, max_y_val * 1.12)
-    ax.set_title(
-        title_str,
-        fontsize=13,
-        fontweight="bold",
-        pad=12,
-        fontproperties=FONT_PROP,
-    )
-    ax.set_xlabel("数据", fontsize=10, fontproperties=FONT_PROP)
-    ax.set_ylabel(
-        "概率密度" if is_density else "频数",
-        fontsize=10,
-        fontproperties=FONT_PROP,
-    )
-    ax.tick_params(axis="both", labelsize=9, colors="#475569")
-    ax.grid(True, ls=":", alpha=0.45, color="#CBD5E1")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    ax.legend(
-        prop=FONT_PROP,
-        fontsize=8.2,
-        loc="upper right",
-        frameon=True,
-        facecolor="white",
-        edgecolor="#E2E8F0",
-    )
-    plt.tight_layout()
-    return save_fig_with_border(fig, show_outer_border, use_tight=True)
-
-  def render_multi_batch_comparison_plot(p_name, p_batch_dict, title_str):
-    active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
-    first_b = p_batch_dict[active_labels[0]]
-    p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
-
-    fig = plt.figure(figsize=(12.2, 6.2), dpi=170)
-    gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1.25], wspace=0.25)
-    ax_dist = fig.add_subplot(gs[0, 0])
-    ax_kpi = fig.add_subplot(gs[0, 1])
-
-    span = max(p_usl - p_lsl, 1e-6)
-    all_concat = np.concatenate(
-        [p_batch_dict[lbl]["all_valid_vals"] for lbl in active_labels]
-    )
-    x_min = min(p_lsl - 0.15 * span, float(np.min(all_concat)) - 0.05 * span)
-    x_max = max(p_usl + 0.15 * span, float(np.max(all_concat)) + 0.05 * span)
-    x_grid = np.linspace(x_min, x_max, 400)
-
-    for idx, lbl in enumerate(active_labels):
-      b = p_batch_dict[lbl]
-      col = BATCH_COLORS[idx % len(BATCH_COLORS)]
-      s_ov = b["std_overall"]
-      if s_ov > 1e-12:
-        ax_dist.plot(
-            x_grid,
-            stats.norm.pdf(x_grid, b["sample_mean"], s_ov),
-            color=col,
-            lw=2.0,
-            label=f"{lbl} (CPK={b['cpk']:.2f}, μ={b['sample_mean']:.3f})",
-        )
-      ax_dist.axvline(b["sample_mean"], color=col, ls=":", lw=1.1, alpha=0.8)
-
-    ax_dist.axvline(p_lsl, color="#DC2626", ls="--", lw=1.3)
-    ax_dist.axvline(p_usl, color="#DC2626", ls="--", lw=1.3)
-    ax_dist.axvline(p_target, color="#16A34A", ls="-.", lw=1.1)
-
-    y_top = ax_dist.get_ylim()[1]
-    ax_dist.text(
-        p_lsl,
-        y_top * 0.98,
-        f"LSL {p_lsl}",
-        color="#B91C1C",
-        ha="center",
-        va="top",
-        fontsize=8.2,
-        fontweight="bold",
-    )
-    ax_dist.text(
-        p_usl,
-        y_top * 0.98,
-        f"USL {p_usl}",
-        color="#B91C1C",
-        ha="center",
-        va="top",
-        fontsize=8.2,
-        fontweight="bold",
-    )
-    ax_dist.text(
-        p_target,
-        y_top * 0.98,
-        f"Tgt {p_target}",
-        color="#15803D",
-        ha="center",
-        va="top",
-        fontsize=8.2,
-    )
-
-    ax_dist.set_title(
-        "各批次正态分布与中心偏移对比",
-        fontsize=10.5,
-        fontproperties=FONT_PROP,
-    )
-    ax_dist.set_xlabel("测量值", fontsize=9.5, fontproperties=FONT_PROP)
-    ax_dist.set_ylabel("概率密度", fontsize=9.5, fontproperties=FONT_PROP)
-    ax_dist.legend(prop=FONT_PROP, fontsize=8.0, loc="upper left")
-    ax_dist.grid(True, ls=":", alpha=0.45)
-
-    x_pos = np.arange(len(active_labels))
-    bar_w = 0.34
-    cpk_vals = [p_batch_dict[lbl]["cpk"] for lbl in active_labels]
-    ppk_vals = [p_batch_dict[lbl]["ppk"] for lbl in active_labels]
-
-    bars1 = ax_kpi.bar(
-        x_pos - bar_w / 2,
-        cpk_vals,
-        width=bar_w,
-        color="#2563EB",
-        label="CPK (组内)",
-    )
-    bars2 = ax_kpi.bar(
-        x_pos + bar_w / 2,
-        ppk_vals,
-        width=bar_w,
-        color="#93C5FD",
-        edgecolor="#1D4ED8",
-        label="PPK (整体)",
-    )
-    ax_kpi.axhline(1.33, color="#16A34A", ls="--", lw=1.1, label="基准 1.33")
-    ax_kpi.axhline(1.00, color="#DC2626", ls=":", lw=1.0, label="警戒 1.00")
-
-    for br in list(bars1) + list(bars2):
-      h_val = br.get_height()
-      if np.isfinite(h_val):
-        ax_kpi.text(
-            br.get_x() + br.get_width() / 2,
-            h_val + 0.03,
-            f"{h_val:.2f}",
-            ha="center",
-            va="bottom",
-            fontsize=7.8,
-        )
-
-    ax_kpi.set_xticks(x_pos)
-    ax_kpi.set_xticklabels(
-        [lbl.split(":")[0] for lbl in active_labels],
-        fontsize=8.8,
-        fontproperties=FONT_PROP,
-    )
-    ax_kpi.set_ylim(0, max(1.8, float(np.nanmax(cpk_vals + ppk_vals)) * 1.22))
-    ax_kpi.set_title("各批次过程能力指数对比", fontsize=10.5, fontproperties=FONT_PROP)
-    ax_kpi.legend(prop=FONT_PROP, fontsize=7.6, loc="upper right")
-    ax_kpi.grid(True, axis="y", ls=":", alpha=0.45)
-
-    fig.suptitle(
-        title_str,
-        fontsize=13,
-        fontweight="bold",
-        y=0.98,
-        fontproperties=FONT_PROP,
-    )
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-    return save_fig_with_border(fig, show_outer_border, use_tight=True)
-
-  def render_multi_batch_mean_trend(p_name, p_batch_dict, title_str):
-    active_labels = [lbl for lbl in batch_labels_all if lbl in p_batch_dict]
-    first_b = p_batch_dict[active_labels[0]]
-    p_lsl, p_target, p_usl = first_b["lsl"], first_b["target"], first_b["usl"]
-
-    fig, ax = plt.subplots(figsize=(12.8, 5.4), dpi=170)
-    max_len = 1
-    for idx, lbl in enumerate(active_labels):
-      y_m = p_batch_dict[lbl]["df_clean"]["_Row_Mean_"].to_numpy(dtype=float)
-      x_s = np.arange(1, len(y_m) + 1)
-      max_len = max(max_len, len(y_m))
-      ax.plot(
-          x_s,
-          y_m,
-          color=BATCH_COLORS[idx % len(BATCH_COLORS)],
-          lw=1.8,
-          alpha=0.88,
-          label=lbl,
-      )
-
-    ax.axhline(
-        p_usl, color="#DC2626", ls="--", lw=1.2, label=f"USL ({p_usl})"
-    )
-    ax.axhline(
-        p_target, color="#16A34A", ls="-.", lw=1.1, label=f"Target ({p_target})"
-    )
-    ax.axhline(
-        p_lsl, color="#DC2626", ls="--", lw=1.2, label=f"LSL ({p_lsl})"
-    )
-
-    ax.set_xlim(1, max(2, max_len))
-    ax.set_title(
-        title_str, fontsize=12.5, fontweight="bold", fontproperties=FONT_PROP
-    )
-    ax.set_xlabel(
-        "区间内样本序号 (1..N)", fontsize=9.5, fontproperties=FONT_PROP
-    )
-    ax.set_ylabel("行均值", fontsize=9.5, fontproperties=FONT_PROP)
-    ax.grid(True, ls=":", alpha=0.45)
-    ax.legend(prop=FONT_PROP, fontsize=8.2, ncol=min(5, len(active_labels) + 3))
-    plt.tight_layout()
-    return save_fig_with_border(fig, show_outer_border, use_tight=True)
-
-  def render_single_batch_capability_plot(b, title_str):
-    fig = plt.figure(figsize=(9.6, 7.2), dpi=170)
-    gs = fig.add_gridspec(
-        2,
-        3,
-        width_ratios=[1.05, 2.35, 0.95],
-        height_ratios=[3.6, 1.15],
-        wspace=0.06,
-        hspace=0.22,
-    )
-    ax_left = fig.add_subplot(gs[0, 0])
-    ax_mid = fig.add_subplot(gs[0, 1])
-    ax_right = fig.add_subplot(gs[0, 2])
-    ax_bot_left = fig.add_subplot(gs[1, 0])
-    ax_bot_mid = fig.add_subplot(gs[1, 1])
-    ax_bot_right = fig.add_subplot(gs[1, 2])
-    for ax_tmp in (ax_left, ax_right, ax_bot_left, ax_bot_mid, ax_bot_right):
-      ax_tmp.axis("off")
-
-    all_v = b["all_valid_vals"]
-    tot_n = b["total_n"]
-    s_mean = b["sample_mean"]
-    s_ov = b["std_overall"]
-    s_wi = b["std_within"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    bins_count = min(38, max(14, int(np.sqrt(tot_n) * 0.55)))
-    counts, _, _ = ax_mid.hist(
-        all_v,
-        bins=bins_count,
-        density=True,
-        color="#78A2CC",
-        edgecolor="#3A5F85",
-        linewidth=0.55,
-        alpha=0.92,
-    )
-
-    span = max(p_usl - p_lsl, 1e-6)
-    x_min_c = min(p_lsl - 0.18 * span, float(np.min(all_v)) - 0.08 * span)
-    x_max_c = max(p_usl + 0.18 * span, float(np.max(all_v)) + 0.08 * span)
-    x_grid = np.linspace(x_min_c, x_max_c, 500)
-
-    line_ov, line_wi = None, None
-    if s_ov > 1e-12:
-      (line_ov,) = ax_mid.plot(
-          x_grid,
-          stats.norm.pdf(x_grid, s_mean, s_ov),
-          color="#B91C1C",
-          lw=1.8,
-          label="Overall",
-      )
-    if s_wi > 1e-12:
-      (line_wi,) = ax_mid.plot(
-          x_grid,
-          stats.norm.pdf(x_grid, s_mean, s_wi),
-          color="#374151",
-          lw=1.6,
-          ls="--",
-          label="Within",
-      )
-
-    ax_mid.axvline(p_lsl, color="#DC2626", ls="--", lw=1.15)
-    ax_mid.axvline(p_usl, color="#DC2626", ls="--", lw=1.15)
-    ax_mid.axvline(p_target, color="#16A34A", ls=":", lw=1.1)
-
-    y_peak = max(
-        float(np.max(counts)) if len(counts) else 1.0,
-        float(np.max(stats.norm.pdf(x_grid, s_mean, s_wi)))
-        if s_wi > 1e-12
-        else 1.0,
-        1e-6,
-    )
-    ax_mid.set_ylim(0, y_peak * 1.14)
-    ax_mid.set_yticks([])
-    ax_mid.grid(True, axis="x", ls=":", alpha=0.45)
-
-    ax_mid.text(
-        p_lsl,
-        y_peak * 1.16,
-        f"LSL\n{p_lsl:.2f}",
-        color="#B91C1C",
-        ha="center",
-        va="bottom",
-        fontsize=8.2,
-        fontweight="bold",
-    )
-    ax_mid.text(
-        p_usl,
-        y_peak * 1.16,
-        f"USL\n{p_usl:.2f}",
-        color="#B91C1C",
-        ha="center",
-        va="bottom",
-        fontsize=8.2,
-        fontweight="bold",
-    )
-    ax_mid.text(
-        p_target,
-        y_peak * 1.16,
-        f"Target\n{p_target:.2f}",
-        color="#15803D",
-        ha="center",
-        va="bottom",
-        fontsize=8.2,
-    )
-
-    left_text = (
-        f"Process Data\n----------------------\n"
-        f"LSL          {p_lsl:.4f}\nTarget       {p_target:.4f}\nUSL          {p_usl:.4f}\n"
-        f"Mean         {s_mean:.4f}\nSample N     {tot_n}\nValid Rows   {len(b['df_clean'])}\n"
-        f"Subgroup     {len(b['cols'])}\nStDev(Ov)    {s_ov:.5f}\nStDev(Wi)    {s_wi:.5f}"
-    )
-    ax_left.text(
-        0.95,
-        0.96,
-        left_text,
-        transform=ax_left.transAxes,
-        va="top",
-        ha="right",
-        fontsize=8.2,
-        fontfamily="monospace",
-        color="#1E293B",
-    )
-
-    right_text = (
-        f"Overall Capability\n------------------\n"
-        f"Pp        {b['pp']:.2f}\nPPL       {b['ppl']:.2f}\nPPU       {b['ppu']:.2f}\nPpk       {b['ppk']:.2f}\n\n"
-        f"Potential (Within)\n------------------\n"
-        f"Cp        {b['cp']:.2f}\nCPL       {b['cpl']:.2f}\nCPU       {b['cpu']:.2f}\nCpk       {b['cpk']:.2f}"
-    )
-    ax_right.text(
-        0.06,
-        0.96,
-        right_text,
-        transform=ax_right.transAxes,
-        va="top",
-        ha="left",
-        fontsize=8.2,
-        fontfamily="monospace",
-        color="#1E293B",
-    )
-
-    handles_leg = [h for h in (line_ov, line_wi) if h is not None]
-    if handles_leg:
-      ax_bot_right.legend(
-          handles=handles_leg,
-          loc="upper left",
-          bbox_to_anchor=(0.04, 0.98),
-          fontsize=8.2,
-      )
-
-    ppm_text = (
-        f"Performance (PPM)        Observed    Exp. Overall    Exp. Within\n"
-        f"----------------------------------------------------------------\n"
-        f"PPM < LSL               {b['obs_lt_lsl']:9.2f}       {b['exp_ov_lt_lsl']:9.2f}      {b['exp_wi_lt_lsl']:9.2f}\n"
-        f"PPM > USL               {b['obs_gt_usl']:9.2f}       {b['exp_ov_gt_usl']:9.2f}      {b['exp_wi_gt_usl']:9.2f}\n"
-        f"Total PPM               {b['obs_total']:9.2f}       {b['exp_ov_total']:9.2f}      {b['exp_wi_total']:9.2f}"
-    )
-    ax_bot_mid.text(
-        0.5,
-        0.92,
-        ppm_text,
-        transform=ax_bot_mid.transAxes,
-        va="top",
-        ha="center",
-        fontsize=7.8,
-        fontfamily="monospace",
-        color="#1E293B",
-        bbox=dict(
-            boxstyle="round,pad=0.4", facecolor="#F8FAFC", edgecolor="#E2E8F0"
-        ),
-    )
-
-    fig.suptitle(
-        title_str,
-        fontsize=13,
-        fontweight="bold",
-        y=0.96,
-        fontproperties=FONT_PROP,
-    )
-    plt.subplots_adjust(left=0.025, right=0.975, top=0.835, bottom=0.045)
-    return save_fig_with_border(fig, show_outer_border, use_tight=False)
-
-  def render_single_batch_box_plot(b, title_str, show_outliers=False):
-    fig, ax = plt.subplots(figsize=(9.6, 6.4), dpi=170)
-    df_c = b["df_clean"]
-    p_cols = b["cols"]
-    p_lsl, p_target, p_usl = b["lsl"], b["target"], b["usl"]
-
-    box_data = [
-        arr if len(arr) > 0 else np.array([p_target], dtype=float)
-        for arr in (df_c[c].dropna().to_numpy(dtype=float) for c in p_cols)
-    ]
-    ax.boxplot(
-        box_data,
-        tick_labels=[str(c) for c in p_cols],
-        patch_artist=True,
-        showfliers=show_outliers,
-        widths=0.4,
-        boxprops=dict(facecolor="#78A2CC", edgecolor="#2B4C7E", linewidth=1.0),
-        medianprops=dict(color="#111827", linewidth=1.3),
-    )
-    ax.axhline(p_usl, color="#DC2626", ls="--", lw=1.2)
-    ax.axhline(p_target, color="#16A34A", ls=":", lw=1.1)
-    ax.axhline(p_lsl, color="#DC2626", ls="--", lw=1.2)
-    ax.set_title(
-        title_str,
-        fontsize=12.5,
-        fontweight="bold",
-        pad=10,
-        fontproperties=FONT_PROP,
-    )
-    ax.tick_params(axis="x", rotation=35 if len(p_cols) > 5 else 0, labelsize=8.5)
-    for lbl in ax.get_xticklabels():
-      lbl.set_fontproperties(FONT_PROP)
-    ax.grid(True, ls=":", alpha=0.45)
-    plt.tight_layout()
-    return save_fig_with_border(fig, show_outer_border, use_tight=False)
-
   st.subheader("多批次指标横向对比总览")
   st.caption(f"当前样本区间规则：{sample_range_mode}")
 
@@ -3869,48 +3817,84 @@ def run_v2_app():
 
   st.dataframe(pd.DataFrame(cmp_rows), width="stretch", hide_index=True)
 
-  zip_buf = io.BytesIO()
-  with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    for p_name in ready_projects:
-      safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
-      t_cmp = str(
-          st.session_state.get(
-              f"v2_t_cmp_{dataset_key}_{p_name}", f"{p_name} — 多批次对比"
-          )
+  # 按需打包 ZIP（不再每次刷新自动重绘所有项目与批次图片）
+  v2_zip_state_key = f"v2_zip_bytes_{dataset_key}"
+  v2_zip_sig_key = f"v2_zip_sig_{dataset_key}"
+  v2_cur_zip_sig = (
+      "|".join(
+          f"{pn}:{','.join(bundles_by_project[pn][bl]['fp'] for bl in bundles_by_project[pn])}"
+          for pn in ready_projects
       )
-      t_hist_z = str(
-          st.session_state.get(
-              f"v2_t_hist_{dataset_key}_{p_name}", f"{p_name} — 多批次含组直方图"
-          )
-      )
-      zf.writestr(
-          f"{safe_p}/{safe_p}_多批次分布与CPK对比.png",
-          render_multi_batch_comparison_plot(
-              p_name, bundles_by_project[p_name], t_cmp
-          ).getvalue(),
-      )
-      zf.writestr(
-          f"{safe_p}/{safe_p}_多批次含组直方图.png",
-          render_grouped_histogram_plot(
-              p_name, bundles_by_project[p_name], t_hist_z
-          ).getvalue(),
-      )
-      for b_lbl, b_obj in bundles_by_project[p_name].items():
-        safe_b = re.sub(r'[\\/*?:"<>|]', "_", b_lbl)
-        zf.writestr(
-            f"{safe_p}/{safe_b}/{safe_p}_{safe_b}_CPK.png",
-            render_single_batch_capability_plot(
-                b_obj, f"{p_name} [{b_lbl}] — Process Capability Report"
-            ).getvalue(),
-        )
-  zip_buf.seek(0)
-  st.download_button(
-      "下载",
-      data=zip_buf,
-      file_name="v2.0_多批次SPC对比图表包.zip",
-      mime="application/zip",
-      key=f"v2_dl_zip_{dataset_key}",
+      + f"|border={show_outer_border}"
   )
+  if st.button(
+      "📦 打包生成多批次对比图表 ZIP",
+      key=f"v2_prep_zip_{dataset_key}",
+  ):
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+      for p_name in ready_projects:
+        safe_p = re.sub(r'[\\/*?:"<>|]', "_", p_name)
+        t_cmp = str(
+            st.session_state.get(
+                f"v2_t_cmp_{dataset_key}_{p_name}", f"{p_name} — 多批次对比"
+            )
+        )
+        t_hist_z = str(
+            st.session_state.get(
+                f"v2_t_hist_{dataset_key}_{p_name}",
+                f"{p_name} — 多批次含组直方图",
+            )
+        )
+        zf.writestr(
+            f"{safe_p}/{safe_p}_多批次分布与CPK对比.png",
+            cached_multi_batch_comparison_png(
+                batch_labels_all,
+                bundles_by_project[p_name],
+                t_cmp,
+                show_outer_border,
+            ),
+        )
+        zf.writestr(
+            f"{safe_p}/{safe_p}_多批次含组直方图.png",
+            cached_grouped_histogram_png(
+                batch_labels_all,
+                bundles_by_project[p_name],
+                t_hist_z,
+                22,
+                "频数 (Count)",
+                True,
+                True,
+                show_outer_border,
+            ),
+        )
+        for b_lbl, b_obj in bundles_by_project[p_name].items():
+          safe_b = re.sub(r'[\\/*?:"<>|]', "_", b_lbl)
+          zf.writestr(
+              f"{safe_p}/{safe_b}/{safe_p}_{safe_b}_CPK.png",
+              cached_capability_png(
+                  b_obj["fp"],
+                  b_obj,
+                  f"{p_name} [{b_lbl}] — Process Capability Report",
+                  9.6,
+                  7.2,
+                  show_outer_border,
+              ),
+          )
+    st.session_state[v2_zip_state_key] = zip_buf.getvalue()
+    st.session_state[v2_zip_sig_key] = v2_cur_zip_sig
+
+  if (
+      st.session_state.get(v2_zip_state_key)
+      and st.session_state.get(v2_zip_sig_key) == v2_cur_zip_sig
+  ):
+    st.download_button(
+        "下载 ZIP 包",
+        data=st.session_state[v2_zip_state_key],
+        file_name="v2.0_多批次SPC对比图表包.zip",
+        mime="application/zip",
+        key=f"v2_dl_zip_{dataset_key}",
+    )
 
   proj_tabs = st.tabs([f"📊 {p_name}" for p_name in ready_projects])
   for p_tab, p_name in zip(proj_tabs, ready_projects):
@@ -3965,10 +3949,12 @@ def run_v2_app():
       ])
 
       with sub_cmp:
-        buf_cmp = render_multi_batch_comparison_plot(p_name, p_batch_map, t_cmp)
-        st.image(buf_cmp, width=980)
+        png_cmp = cached_multi_batch_comparison_png(
+            batch_labels_all, p_batch_map, t_cmp, show_outer_border
+        )
+        st.image(png_cmp, width=980)
         render_chart_action_bar(
-            buf_cmp,
+            png_cmp,
             f"{safe_p}_MultiBatch_Compare.png",
             f"v2_cmp_{dataset_key}_{p_name}",
         )
@@ -4001,29 +3987,30 @@ def run_v2_app():
             key=f"v2_hspec_{dataset_key}_{p_name}",
         )
 
-        buf_hist = render_grouped_histogram_plot(
-            p_name,
+        png_hist = cached_grouped_histogram_png(
+            batch_labels_all,
             p_batch_map,
             t_hist,
-            bins_num=hist_bins,
-            y_metric=hist_y_metric,
-            show_normal_fit=show_fit_line,
-            show_spec_lines=show_h_spec,
+            hist_bins,
+            hist_y_metric,
+            show_fit_line,
+            show_h_spec,
+            show_outer_border,
         )
-        st.image(buf_hist, width=980)
+        st.image(png_hist, width=980)
         render_chart_action_bar(
-            buf_hist,
+            png_hist,
             f"{safe_p}_Grouped_Histogram.png",
             f"v2_hist_{dataset_key}_{p_name}",
         )
 
         st.markdown("---")
-        buf_mt = render_multi_batch_mean_trend(
-            p_name, p_batch_map, t_mean_title
+        png_mt = cached_multi_batch_mean_trend_png(
+            batch_labels_all, p_batch_map, t_mean_title, show_outer_border
         )
-        st.image(buf_mt, width=1020)
+        st.image(png_mt, width=1020)
         render_chart_action_bar(
-            buf_mt,
+            png_mt,
             f"{safe_p}_MultiBatch_MeanTrend.png",
             f"v2_mt_{dataset_key}_{p_name}",
         )
@@ -4035,16 +4022,22 @@ def run_v2_app():
             key=f"v2_pick_batch_{dataset_key}_{p_name}",
         )
         b_cur = p_batch_map[chosen_b_lbl]
+        b_cur_fp = b_cur["fp"]
         safe_b = re.sub(r'[\\/*?:"<>|]', "_", chosen_b_lbl)
 
         sc_left, sc_right = st.columns(2)
         with sc_left:
-          buf_b_cap = render_single_batch_capability_plot(
-              b_cur, f"{t_cap_prefix} [{chosen_b_lbl}]"
+          png_b_cap = cached_capability_png(
+              b_cur_fp,
+              b_cur,
+              f"{t_cap_prefix} [{chosen_b_lbl}]",
+              9.6,
+              7.2,
+              show_outer_border,
           )
-          st.image(buf_b_cap, width=640)
+          st.image(png_b_cap, width=640)
           render_chart_action_bar(
-              buf_b_cap,
+              png_b_cap,
               f"{safe_p}_{safe_b}_CPK.png",
               f"v2_bcap_{dataset_key}_{p_name}_{chosen_b_lbl}",
           )
@@ -4054,14 +4047,21 @@ def run_v2_app():
               value=False,
               key=f"v2_bout_{dataset_key}_{p_name}_{chosen_b_lbl}",
           )
-          buf_b_box = render_single_batch_box_plot(
+          png_b_box = cached_box_png(
+              b_cur_fp,
               b_cur,
               f"{t_box_prefix} [{chosen_b_lbl}]",
-              show_outliers=show_out_b,
+              9.6,
+              6.4,
+              show_out_b,
+              False,
+              False,
+              4,
+              show_outer_border,
           )
-          st.image(buf_b_box, width=640)
+          st.image(png_b_box, width=640)
           render_chart_action_bar(
-              buf_b_box,
+              png_b_box,
               f"{safe_p}_{safe_b}_Box.png",
               f"v2_bbox_{dataset_key}_{p_name}_{chosen_b_lbl}",
           )
